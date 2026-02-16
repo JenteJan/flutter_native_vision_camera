@@ -135,7 +135,7 @@ await controller.stopRecording();
 
 | Platform | Support | Notes |
 |----------|---------|-------|
-| **Android** | ✅ Full | Camera2, MLKit, FFI, Recording |
+| **Android** | ✅ Full | CameraX, MLKit, FFI, Recording |
 | **iOS** | ⚠️ Partial | AVFoundation, Vision API, Preview only. Recording & FFI coming soon. |
 
 ## Credits & Attribution

@@ -1,50 +1,37 @@
-package dev.jentejan.flutter_native_vision_camera
+﻿package dev.jentejan.flutter_native_vision_camera
 
 import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.SurfaceTexture
+import android.graphics.*
 import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraCaptureSession
-import android.hardware.camera2.CameraDevice
-import android.hardware.camera2.CameraManager
-import android.hardware.camera2.CaptureRequest
-import android.hardware.camera2.TotalCaptureResult
-import android.hardware.camera2.params.OutputConfiguration
-import android.hardware.camera2.params.SessionConfiguration
-import android.media.Image
-import android.media.ImageReader
-import android.media.MediaRecorder
-import android.media.ImageWriter
-import android.util.Size
-import com.google.mlkit.vision.barcode.BarcodeScanner
-import com.google.mlkit.vision.barcode.BarcodeScanning
-import com.google.mlkit.vision.barcode.common.Barcode
-import com.google.mlkit.vision.barcode.BarcodeScannerOptions
-import com.google.mlkit.vision.common.InputImage
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.Matrix
-import android.graphics.Rect
-import android.hardware.camera2.params.MeteringRectangle
 import android.os.Build
 import android.os.Handler
-import android.os.HandlerThread
+import android.os.Looper
 import android.util.Log
-import android.view.Surface
+import android.util.Size
 import android.view.OrientationEventListener
-import java.io.File
-import java.io.FileOutputStream
-import java.nio.ByteBuffer
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
-import java.util.concurrent.Executor
-import java.util.concurrent.Executors
+import android.view.Surface
+import androidx.annotation.OptIn
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
+import androidx.camera.core.*
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.*
+import androidx.camera.video.VideoCapture
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import androidx.exifinterface.media.ExifInterface
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.LifecycleRegistry
+import com.google.mlkit.vision.barcode.BarcodeScanner
+import com.google.mlkit.vision.barcode.BarcodeScannerOptions
+import com.google.mlkit.vision.barcode.BarcodeScanning
+import com.google.mlkit.vision.barcode.common.Barcode
+import com.google.mlkit.vision.common.InputImage
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
@@ -53,16 +40,22 @@ import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.PluginRegistry
 import io.flutter.view.TextureRegistry
-import java.util.concurrent.ConcurrentHashMap
+import java.io.File
+import java.util.concurrent.*
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Android implementation of the Flutter Native Vision Camera plugin.
  *
- * Uses Camera2 API for camera access, Flutter TextureRegistry for
- * zero-copy GPU preview, and MethodChannel for control commands.
+ * Migrated to CameraX API for improved stability and lifecycle management.
+ * Uses Flutter TextureRegistry for zero-copy GPU preview.
  */
-class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, PluginRegistry.RequestPermissionsResultListener {
+class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, PluginRegistry.RequestPermissionsResultListener, LifecycleOwner {
+
+    private lateinit var lifecycleRegistry: LifecycleRegistry
+    override val lifecycle: Lifecycle get() = lifecycleRegistry
 
     // Native dispatcher
     private external fun nativeDispatchFrame(buffer: java.nio.ByteBuffer, width: Int, height: Int, format: Int, orientation: Int, timestamp: Double, id: Long, address: Long)
@@ -75,47 +68,44 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
     private var binding: ActivityPluginBinding? = null
     private var pendingPermissionResult: MethodChannel.Result? = null
 
-    private var cameraManager: CameraManager? = null
-    private var cameraDevice: CameraDevice? = null
-    private var captureSession: CameraCaptureSession? = null
+    // CameraX components
+    private var cameraProvider: ProcessCameraProvider? = null
+    private var camera: androidx.camera.core.Camera? = null
+    private var preview: Preview? = null
+    private var imageAnalysis: ImageAnalysis? = null
+    private var imageCapture: ImageCapture? = null
+    private var videoCapture: VideoCapture<Recorder>? = null
+    private var activeRecording: Recording? = null
+    private var cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+
     private var surfaceProducer: TextureRegistry.SurfaceProducer? = null
-    private var previewSurface: Surface? = null
-    private var photoReader: ImageReader? = null
-    private var frameReader: ImageReader? = null
+    
     @Volatile private var isFrameProcessorEnabled = false
-    private var mediaRecorder: MediaRecorder? = null
     private var videoPath: String? = null
-    private var lastZoom: Float = 1.0f // Track zoom level
-    private var lastAFTriggerZoom: Float = 1.0f
+    private var lastZoom: Float = 1.0f 
     private var lastTorchMode: String = "off"
     private var lastExposure: Int = 0
     private var isFrontCamera: Boolean = false
     private var activeDeviceId: String? = null
-    private var isManualFocusActive: Boolean = false
     @Volatile private var isActive: Boolean = false
     
     private var barcodeScanner: BarcodeScanner? = null
     @Volatile private var isCodeScannerEnabled = false
     private var currentFormat: Map<String, Any>? = null
     
-    // Video Metadata Tracking
-    private var videoWidth = 1920
-    private var videoHeight = 1080
     private var recordingStartTime: Long = 0
+    private var pendingVideoResult: MethodChannel.Result? = null
 
-    private var backgroundThread: HandlerThread? = null
-    private var backgroundHandler: Handler? = null
-    private val isProcessingCode = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val isProcessingCode = AtomicBoolean(false)
     private var lastScanTime: Long = 0
-    private val scanThrottleMs: Long = 200 // Max 5 scans per second
+    private val scanThrottleMs: Long = 200 
 
-    private var mainHandler: Handler = Handler(android.os.Looper.getMainLooper())
-    private var mainExecutor: Executor = Executor { command -> mainHandler.post(command) }
+    private var mainHandler: Handler = Handler(Looper.getMainLooper())
     
     private var orientationEventListener: OrientationEventListener? = null
     private var physicalOrientation: Int = Surface.ROTATION_0
 
-    private class ManagedImage(val image: Image) {
+    private class ManagedImageProxy(val image: ImageProxy) {
         val refCount = AtomicInteger(1)
     }
 
@@ -123,10 +113,10 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
         private const val CHANNEL_NAME = "dev.jentejan.flutter_native_vision_camera/camera"
         private const val CAMERA_PERMISSION_REQUEST = 1001
 
-        private val frameIdCounter = java.util.concurrent.atomic.AtomicLong(0)
+        private val frameIdCounter = AtomicLong(0)
 
         // Static frame management to allow easy C -> JNI release calls
-        private val activeFrames = ConcurrentHashMap<Long, ManagedImage>()
+        private val activeFrames = ConcurrentHashMap<Long, ManagedImageProxy>()
 
         @JvmStatic
         @androidx.annotation.Keep
@@ -146,7 +136,6 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
         }
 
         fun clearFrames() {
-            Log.d("CameraPlugin", "Clearing all ${activeFrames.size} active frames")
             activeFrames.forEach { (id, managed) ->
                 try {
                     managed.image.close()
@@ -165,7 +154,15 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
         channel.setMethodCallHandler(this)
         textureRegistry = binding.textureRegistry
         context = binding.applicationContext
-        cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        
+        lifecycleRegistry = LifecycleRegistry(this)
+        lifecycleRegistry.currentState = Lifecycle.State.CREATED
+        
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
+        cameraProviderFuture.addListener({
+            cameraProvider = cameraProviderFuture.get()
+        }, ContextCompat.getMainExecutor(context))
+        
         startOrientationListener()
     }
 
@@ -173,6 +170,7 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
         stopOrientationListener()
         channel.setMethodCallHandler(null)
         releaseCamera(true)
+        lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
     }
 
     private fun startOrientationListener() {
@@ -234,8 +232,8 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
                 initializeCamera(deviceId, format, enablePhoto, enableVideo, codeScanner, result)
             }
             "setActive" -> {
-                val isActive = call.argument<Boolean>("isActive") ?: call.argument<Boolean>("active") ?: false
-                setActive(isActive, result)
+                val active = call.argument<Boolean>("isActive") ?: call.argument<Boolean>("active") ?: false
+                setActive(active, result)
             }
             "setZoom" -> {
                 val zoom = call.argument<Double>("zoom") ?: 1.0
@@ -278,13 +276,11 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
             }
             "setFrameProcessor" -> {
                 isFrameProcessorEnabled = call.argument<Boolean>("enabled") ?: false
-                updateRepeatingRequest()
                 result.success(null)
             }
             "setCodeScanner" -> {
                 val config = call.argument<Map<String, Any>>("codeScanner")
                 updateCodeScanner(config)
-                updateRepeatingRequest()
                 result.success(null)
             }
             "takeSnapshot" -> {
@@ -308,21 +304,24 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
 
     // ─── Device Discovery ──────────────────────────────────────────────
 
+    @OptIn(ExperimentalCamera2Interop::class)
     private fun getAvailableCameraDevices(result: MethodChannel.Result) {
-        val manager = cameraManager ?: run {
-            result.error("CAMERA_ERROR", "CameraManager not available", null)
+        val provider = cameraProvider ?: run {
+            result.error("CAMERA_ERROR", "CameraProvider not available", null)
             return
         }
 
-        val devices = manager.cameraIdList.map { id ->
-            val chars = manager.getCameraCharacteristics(id)
-            deviceToMap(id, chars)
+        val devices = provider.availableCameraInfos.map { info ->
+            val camera2Info = Camera2CameraInfo.from(info)
+            deviceToMap(camera2Info)
         }
         result.success(devices)
     }
 
-    private fun deviceToMap(id: String, chars: CameraCharacteristics): Map<String, Any?> {
-        val facing = chars.get(CameraCharacteristics.LENS_FACING)
+    @OptIn(ExperimentalCamera2Interop::class)
+    private fun deviceToMap(info: Camera2CameraInfo): Map<String, Any?> {
+        val id = info.cameraId
+        val facing = info.getCameraCharacteristic(CameraCharacteristics.LENS_FACING)
         val position = when (facing) {
             CameraCharacteristics.LENS_FACING_FRONT -> "front"
             CameraCharacteristics.LENS_FACING_BACK -> "back"
@@ -330,20 +329,16 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
             else -> "back"
         }
 
-        val sensorSize = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-        val hasTorch = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) ?: false
+        val hasTorch = info.getCameraCharacteristic(CameraCharacteristics.FLASH_INFO_AVAILABLE) ?: false
 
-        val zoomRange = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
-        } else null
+        val minZoom = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            info.getCameraCharacteristic(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.lower?.toDouble() ?: 1.0
+        } else 1.0
+        val maxZoom = (info.getCameraCharacteristic(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1.0f).toDouble()
 
-        val minZoom = zoomRange?.lower?.toDouble() ?: 1.0
-        val maxZoom = (chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1.0f).toDouble()
+        val exposureRange = info.getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
 
-        val exposureRange = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
-        val exposureStep = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
-
-        val hardwareLevel = when (chars.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)) {
+        val hardwareLevel = when (info.getCameraCharacteristic(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)) {
             CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_LEGACY -> "legacy"
             CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_LIMITED -> "limited"
             CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_FULL -> "full"
@@ -352,20 +347,34 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
         }
 
         // Build format list from stream configuration map
-        val configMap = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val configMap = info.getCameraCharacteristic(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
         val formats = mutableListOf<Map<String, Any?>>()
+
+        // Calculate a rough Field of View
+        val focalLengths = info.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+        val sensorSize = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+        val fov = if (focalLengths != null && focalLengths.isNotEmpty() && sensorSize != null) {
+            2.0 * Math.atan(sensorSize.width / (2.0 * focalLengths[0])) * 180.0 / Math.PI
+        } else 60.0
+
+        val stabilizationModes = info.getCameraCharacteristic(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
+        val mappedStabilization = mutableListOf<String>("off")
+        stabilizationModes?.forEach { mode ->
+            when (mode) {
+                CameraCharacteristics.CONTROL_VIDEO_STABILIZATION_MODE_ON -> mappedStabilization.add("standard")
+                // Cinematic etc can be mapped if needed
+            }
+        }
 
         if (configMap != null) {
             val previewSizes = configMap.getOutputSizes(SurfaceTexture::class.java)
-            val photoSizes = configMap.getOutputSizes(android.graphics.ImageFormat.JPEG)?.toSet() ?: emptySet()
-            val fpsRanges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            val photoSizes = configMap.getOutputSizes(ImageFormat.JPEG)?.toSet() ?: emptySet()
+            val fpsRanges = info.getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
 
             previewSizes?.forEach { size ->
                 val minFps = fpsRanges?.minByOrNull { it.lower }?.lower ?: 15
                 val maxFps = fpsRanges?.maxByOrNull { it.upper }?.upper ?: 30
 
-                // If this exact size is supported as a photo, use it. 
-                // Otherwise, find the best matching aspect ratio.
                 val photoSize = if (photoSizes.contains(size)) {
                     size
                 } else {
@@ -382,21 +391,21 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
                     "videoWidth" to size.width,
                     "minFps" to minFps,
                     "maxFps" to maxFps,
-                    "minISO" to (chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.lower ?: 100),
-                    "maxISO" to (chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.upper ?: 3200),
-                    "fieldOfView" to 0.0, // TODO: calculate from focal length + sensor size
+                    "minISO" to (info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.lower ?: 100),
+                    "maxISO" to (info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.upper ?: 3200),
                     "maxZoom" to maxZoom,
+                    "fieldOfView" to fov,
                     "supportsVideoHdr" to false,
                     "supportsPhotoHdr" to false,
                     "supportsDepthCapture" to false,
-                    "autoFocusSystem" to "contrast-detection",
-                    "videoStabilizationModes" to listOf("off"),
+                    "autoFocusSystem" to "phase-detection",
+                    "videoStabilizationModes" to mappedStabilization,
                     "pixelFormats" to listOf("yuv"),
                 ))
             }
         }
 
-        val sensorOrientationDegrees = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        val sensorOrientationDegrees = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
         val sensorOrientation = when (sensorOrientationDegrees) {
             0 -> "portrait"
             90 -> "landscape-left"
@@ -418,9 +427,9 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
             "neutralZoom" to 1.0,
             "minExposure" to (exposureRange?.lower?.toDouble() ?: 0.0),
             "maxExposure" to (exposureRange?.upper?.toDouble() ?: 0.0),
+            "supportsFocus" to true,
             "supportsLowLightBoost" to false,
             "supportsRawCapture" to false,
-            "supportsFocus" to true,
             "hardwareLevel" to hardwareLevel,
             "sensorOrientation" to sensorOrientation,
             "physicalDevices" to listOf("wide-angle-camera"),
@@ -430,6 +439,7 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
 
     // ─── Camera Initialization ─────────────────────────────────────────
 
+    @OptIn(ExperimentalCamera2Interop::class)
     @Suppress("MissingPermission")
     private fun initializeCamera(
         deviceId: String,
@@ -440,8 +450,7 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
         result: MethodChannel.Result
     ) {
         val safeResult = SafeResult(result)
-        releaseCamera(false) // Close existing session/camera first, don't stop thread
-        startBackgroundThread() // Only starts if not already running
+        releaseCamera(false) 
         updateCodeScanner(codeScanner)
         lastZoom = 1.0f
         lastTorchMode = "off"
@@ -449,590 +458,369 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
         currentFormat = format
         activeDeviceId = deviceId
 
-        val manager = cameraManager ?: run {
-            safeResult.error("CAMERA_ERROR", "CameraManager not available", null)
+        if (cameraProvider == null) {
+            safeResult.error("CAMERA_ERROR", "CameraProvider not initialized", null)
             return
         }
 
-        val chars = manager.getCameraCharacteristics(deviceId)
-        isFrontCamera = chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
+        // 1. Selector and Rotation
+        val selector = if (deviceId.isEmpty()) {
+            isFrontCamera = false
+            CameraSelector.DEFAULT_BACK_CAMERA
+        } else {
+            CameraSelector.Builder().addCameraFilter { cameras ->
+                cameras.filter { 
+                    val info = Camera2CameraInfo.from(it)
+                    if (info.cameraId == deviceId) {
+                        isFrontCamera = it.cameraInfo.lensFacing == CameraSelector.LENS_FACING_FRONT
+                        true
+                    } else false
+                }
+            }.build()
+        }
 
-        // Create surface producer for preview.
+        val rotation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            activity?.display?.rotation ?: Surface.ROTATION_0
+        } else {
+            @Suppress("DEPRECATION")
+            activity?.windowManager?.defaultDisplay?.rotation ?: Surface.ROTATION_0
+        }
+        
+        // 2. Surface Producer for Flutter Preview
+        // SurfaceProducer is better for Impeller/Vulkan on devices like Pixel 8
         val producer = textureRegistry.createSurfaceProducer()
         surfaceProducer = producer
 
-        manager.openCamera(deviceId, object : CameraDevice.StateCallback() {
-            override fun onOpened(camera: CameraDevice) {
-                cameraDevice = camera
-                createPreviewSession(camera, producer, format, safeResult)
-            }
+        // 3. Resolutions
+        val videoWidth = format?.get("videoWidth") as? Int ?: 1920
+        val videoHeight = format?.get("videoHeight") as? Int ?: 1080
+        val targetSize = Size(videoWidth, videoHeight)
+        
+        val resolutionSelector = ResolutionSelector.Builder()
+            .setResolutionStrategy(ResolutionStrategy(targetSize, ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
+            .build()
 
-            override fun onDisconnected(camera: CameraDevice) {
-                camera.close()
-                cameraDevice = null
-                activity?.runOnUiThread {
-                    channel.invokeMethod("onError", mapOf(
-                        "code" to "device-disconnected",
-                        "message" to "Camera device disconnected",
-                    ))
-                }
+        // 4. Preview UseCase
+        val previewUseCase = Preview.Builder()
+            .setResolutionSelector(resolutionSelector)
+            .setTargetRotation(rotation)
+            .build()
+        
+        previewUseCase.setSurfaceProvider(cameraExecutor) { request ->
+            val res = request.resolution
+            Log.d("CameraPlugin", "CameraX requesting preview surface: ${res.width}x${res.height}")
+            
+            // Important: Set size before providing surface
+            producer.setSize(res.width, res.height)
+            val surface = producer.surface
+            request.provideSurface(surface, cameraExecutor) {
+                // Surface consumed
             }
+        }
+        preview = previewUseCase
 
-            override fun onError(camera: CameraDevice, error: Int) {
-                camera.close()
-                cameraDevice = null
-                safeResult.error("CAMERA_ERROR", "Failed to open camera: error $error", null)
-            }
-        }, mainHandler)
+        // 5. Image Analysis UseCase (Frame Processor)
+        val analysisUseCase = ImageAnalysis.Builder()
+            .setResolutionSelector(resolutionSelector)
+            .setTargetRotation(rotation)
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+            .build()
+        
+        analysisUseCase.setAnalyzer(cameraExecutor) { image ->
+            processFrame(image)
+        }
+        imageAnalysis = analysisUseCase
+
+        // 6. Image Capture UseCase
+        if (enablePhoto) {
+            val photoWidth = format?.get("photoWidth") as? Int ?: 1920
+            val photoHeight = format?.get("photoHeight") as? Int ?: 1080
+            imageCapture = ImageCapture.Builder()
+                .setResolutionSelector(ResolutionSelector.Builder()
+                    .setResolutionStrategy(ResolutionStrategy(Size(photoWidth, photoHeight), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
+                    .build())
+                .setTargetRotation(rotation)
+                .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                .build()
+        }
+
+        // 7. Video Capture UseCase
+        if (enableVideo) {
+            val recorder = Recorder.Builder()
+                .setQualitySelector(QualitySelector.from(Quality.HIGHEST))
+                .build()
+            videoCapture = VideoCapture.Builder(recorder)
+                .setTargetRotation(rotation)
+                .build()
+        }
+
+        // 8. Bind to Lifecycle
+        try {
+            val useCases = mutableListOf<UseCase>(previewUseCase, analysisUseCase)
+            imageCapture?.let { useCases.add(it) }
+            videoCapture?.let { useCases.add(it) }
+
+            camera = cameraProvider?.bindToLifecycle(
+                this,
+                selector,
+                *useCases.toTypedArray()
+            )
+            
+            lifecycleRegistry.currentState = Lifecycle.State.STARTED
+            
+            // Get actual preview resolution after binding
+            val actualRes = previewUseCase.resolutionInfo?.resolution ?: targetSize
+            
+            safeResult.success(mapOf(
+                "textureId" to producer.id(),
+                "previewWidth" to actualRes.width,
+                "previewHeight" to actualRes.height
+            ))
+        } catch (e: Exception) {
+            safeResult.error("CAMERA_ERROR", "Failed to bind use cases: ${e.message}", null)
+        }
     }
 
-    private fun createPreviewSession(
-        camera: CameraDevice,
-        producer: TextureRegistry.SurfaceProducer,
-        format: Map<String, Any>?,
-        result: MethodChannel.Result
-    ) {
-        val safeResult = if (result is SafeResult) result else SafeResult(result)
-        val previewWidth = format?.get("videoWidth") as? Int ?: 1920
-        val previewHeight = format?.get("videoHeight") as? Int ?: 1080
-        val photoWidth = format?.get("photoWidth") as? Int ?: 1920
-        val photoHeight = format?.get("photoHeight") as? Int ?: 1080
+    private fun processFrame(image: ImageProxy) {
+        if (!isActive || (!isFrameProcessorEnabled && !isCodeScannerEnabled)) {
+            image.close()
+            return
+        }
 
-        Log.d("CameraPlugin", "Initializing camera with resolved format: Preview ${previewWidth}x${previewHeight}, Photo ${photoWidth}x${photoHeight}")
-        
-        val chars = cameraManager!!.getCameraCharacteristics(camera.id)
-        val sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-        Log.d("CameraPlugin", "Sensor Orientation: $sensorOrientation")
-        
-        producer.setSize(previewWidth, previewHeight)
-        val surface = producer.surface
-        previewSurface = surface
+        val id = frameIdCounter.incrementAndGet()
+        val managed = ManagedImageProxy(image)
+        activeFrames[id] = managed
 
-        // Setup Photo Reader
-        photoReader = ImageReader.newInstance(photoWidth, photoHeight, android.graphics.ImageFormat.JPEG, 2)
-        
-        // Setup Frame Processor Reader (YUV_420_888 for zero-copy)
-        // Set to 30 to prevent starvation on fast sensors or slow processors
-        frameReader = ImageReader.newInstance(previewWidth, previewHeight, android.graphics.ImageFormat.YUV_420_888, 30)
-        frameReader?.setOnImageAvailableListener({ reader ->
-            val image = try {
-                // Use acquireNextImage to ensure we handle every event and release properly
-                reader.acquireNextImage()
-            } catch (e: Exception) {
-                null
-            } ?: return@setOnImageAvailableListener
-
-            if (!isActive || (!isFrameProcessorEnabled && !isCodeScannerEnabled)) {
-                image.close()
-                return@setOnImageAvailableListener
-            }
-
-            val id = frameIdCounter.incrementAndGet()
-            if (id % 60 == 0L) {
-                val activeCount = activeFrames.size
-                Log.d("CameraPlugin", "Frame $id received (active=$activeCount, scanner=$isCodeScannerEnabled)")
-                if (activeCount > 10) {
-                    Log.w("CameraPlugin", "Warning: High active frame count ($activeCount). Possible leak?")
-                }
-            }
-
-            val managed = ManagedImage(image)
-            activeFrames[id] = managed
-
-            try {
-                // ... logic moved into try block ...
-                var inputImage: InputImage? = null
-                val now = System.currentTimeMillis()
-                val scanning = isProcessingCode.get()
-                val shouldScan = isCodeScannerEnabled && !scanning && (now - lastScanTime) > scanThrottleMs
-                
-                if (shouldScan) {
-                    try {
-                        val rotation = getMlKitRotation()
-                        inputImage = InputImage.fromMediaImage(image, rotation)
-                    } catch (e: Exception) {
-                        Log.e("CameraPlugin", "MLKit: Failed to create InputImage: ${e.message}")
-                    }
-                }
-
-                // 1. Dispatch to Native/C++ (Synchronous)
-                managed.refCount.incrementAndGet()
-                val yBuffer = image.planes[0].buffer
-                nativeDispatchFrame(yBuffer, image.width, image.height, 0x23, sensorOrientation, image.timestamp.toDouble() / 1e9, id, 0L)
-                
-                // 2. MLKit Dispatch (Asynchronous, Throttled)
-                if (shouldScan && inputImage != null) {
-                    val scanner = barcodeScanner
-                    if (scanner != null && isActive) {
-                        try {
-                            isProcessingCode.set(true)
-                            lastScanTime = now
-                            Log.d("CameraPlugin", "MLKit: Starting code scan for frame $id...")
-                            
-                            managed.refCount.incrementAndGet()
-                            scanner.process(inputImage)
-                                .addOnSuccessListener { barcodes ->
-                                    if (isActive) {
-                                        val rotation = getMlKitRotation()
-                                        val isRotated = rotation == 90 || rotation == 270
-                                        val logicalWidth = if (isRotated) image.height else image.width
-                                        val logicalHeight = if (isRotated) image.width else image.height
-
-                                        val resultList = barcodes.map { barcode ->
-                                            val box = barcode.boundingBox
-                                            mapOf(
-                                                "type" to barcodeFormatToString(barcode.format),
-                                                "value" to barcode.rawValue,
-                                                "frame" to if (box != null) mapOf(
-                                                    "x" to box.left.toDouble() / logicalWidth.toDouble(),
-                                                    "y" to box.top.toDouble() / logicalHeight.toDouble(),
-                                                    "width" to box.width().toDouble() / logicalWidth.toDouble(),
-                                                    "height" to box.height().toDouble() / logicalHeight.toDouble()
-                                                ) else null
-                                            )
-                                        }
-
-                                        mainHandler.post {
-                                            if (resultList.isNotEmpty()) {
-                                                Log.d("CameraPlugin", "MLKit: Invoking onCodeScanned (MainThread) with ${resultList.size} codes")
-                                            }
-                                            channel.invokeMethod("onCodeScanned", resultList)
-                                        }
-                                    }
-                                }
-                                .addOnFailureListener { e ->
-                                    if (isActive) Log.e("CameraPlugin", "MLKit: Processing Error for frame $id", e)
-                                }
-                                .addOnCompleteListener {
-                                    isProcessingCode.set(false)
-                                    FlutterNativeVisionCameraPlugin.releaseFrame(id)
-                                }
-                        } catch (e: Exception) {
-                            Log.e("CameraPlugin", "MLKit: Scanner task exception for frame $id", e)
-                            isProcessingCode.set(false)
-                            FlutterNativeVisionCameraPlugin.releaseFrame(id)
-                        }
-                    }
-                }
-            } finally {
-                // 3. Release the base reference for this acquisition loop
-                FlutterNativeVisionCameraPlugin.releaseFrame(id)
-            }
-        }, backgroundHandler)
-
-        val surfaces = mutableListOf(surface, photoReader!!.surface, frameReader!!.surface)
-
-        val previewRequest = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-            addTarget(surface)
-            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+        try {
+            val now = System.currentTimeMillis()
+            val scanning = isProcessingCode.get()
+            val shouldScan = isCodeScannerEnabled && !scanning && (now - lastScanTime) > scanThrottleMs
             
-            // Maximize FPS
-            val fpsRanges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
-            val maxFpsRange = fpsRanges?.maxByOrNull { it.upper }
-            if (maxFpsRange != null) {
-                set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, maxFpsRange)
-            }
+            if (shouldScan) {
+                val inputImage = InputImage.fromMediaImage(image.image!!, image.imageInfo.rotationDegrees)
+                val scanner = barcodeScanner
+                if (scanner != null && isActive) {
+                    isProcessingCode.set(true)
+                    lastScanTime = now
+                    managed.refCount.incrementAndGet()
+                    
+                    val rotation = image.imageInfo.rotationDegrees
+                    val isRotated = rotation == 90 || rotation == 270
+                    val logicalWidth = if (isRotated) image.height else image.width
+                    val logicalHeight = if (isRotated) image.width else image.height
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                set(CaptureRequest.CONTROL_ZOOM_RATIO, lastZoom)
-            }
-        }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            val outputConfigs = surfaces.map { OutputConfiguration(it) }
-            val sessionConfig = SessionConfiguration(
-                SessionConfiguration.SESSION_REGULAR,
-                outputConfigs,
-                mainExecutor,
-                object : CameraCaptureSession.StateCallback() {
-                    override fun onConfigured(session: CameraCaptureSession) {
-                        captureSession = session
-                        updateRepeatingRequest()
-                            
-                        // Prime the session with a single capture to kickstart the pipeline
-                        try {
-                            val primeBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-                            primeBuilder.addTarget(surface)
-                            session.capture(primeBuilder.build(), null, backgroundHandler)
-                        } catch (e: Exception) {
-                            Log.e("CameraPlugin", "Priming failed: ${e.message}")
+                    scanner.process(inputImage)
+                        .addOnSuccessListener { barcodes ->
+                            if (isActive) {
+                                val results = barcodes.map { barcode ->
+                                    val box = barcode.boundingBox
+                                    mapOf(
+                                        "value" to barcode.rawValue,
+                                        "type" to barcodeFormatToString(barcode.format),
+                                        "frame" to if (box != null) mapOf(
+                                            "x" to box.left.toDouble() / logicalWidth.toDouble(),
+                                            "y" to box.top.toDouble() / logicalHeight.toDouble(),
+                                            "width" to box.width().toDouble() / logicalWidth.toDouble(),
+                                            "height" to box.height().toDouble() / logicalHeight.toDouble()
+                                        ) else null,
+                                        "corners" to barcode.cornerPoints?.map { mapOf("x" to it.x, "y" to it.y) }
+                                    )
+                                }
+                                mainHandler.post {
+                                    channel.invokeMethod("onCodeScanned", results)
+                                }
+                            }
                         }
-
-                        result.success(mapOf(
-                            "textureId" to producer.id(),
-                            "previewWidth" to previewWidth,
-                            "previewHeight" to previewHeight
-                        ))
-                    }
-
-                    override fun onConfigureFailed(session: CameraCaptureSession) {
-                        result.error("CAMERA_ERROR", "Failed to configure capture session", null)
-                    }
+                        .addOnFailureListener { e ->
+                            if (isActive) Log.e("CameraPlugin", "MLKit Error: ${e.message}")
+                        }
+                        .addOnCompleteListener {
+                            isProcessingCode.set(false)
+                            releaseFrame(id)
+                        }
                 }
-            )
-            camera.createCaptureSession(sessionConfig)
-        } else {
-            @Suppress("DEPRECATION")
-            camera.createCaptureSession(
-                surfaces,
-                object : CameraCaptureSession.StateCallback() {
-                    override fun onConfigured(session: CameraCaptureSession) {
-                        captureSession = session
-                        try {
-                            session.capture(previewRequest.build(), null, backgroundHandler)
-                            session.setRepeatingRequest(
-                                previewRequest.build(),
-                                null,
-                                backgroundHandler,
-                            )
-                        } catch (e: Exception) {
-                            Log.e("CameraPlugin", "Failed to start preview: ${e.message}")
-                        }
-                        result.success(mapOf(
-                            "textureId" to producer.id(),
-                            "previewWidth" to previewWidth,
-                            "previewHeight" to previewHeight
-                        ))
-                    }
+            }
 
-                    override fun onConfigureFailed(session: CameraCaptureSession) {
-                        result.error("CAMERA_ERROR", "Failed to configure capture session", null)
-                    }
-                },
-                backgroundHandler,
+            // Dispatch to Native/C++ (Synchronous)
+            managed.refCount.incrementAndGet()
+            val yBuffer = image.planes[0].buffer
+            nativeDispatchFrame(
+                yBuffer, 
+                image.width, 
+                image.height, 
+                0x23, // YUV_420_888
+                image.imageInfo.rotationDegrees, 
+                image.imageInfo.timestamp.toDouble() / 1e9, 
+                id, 
+                0L
             )
+        } finally {
+            releaseFrame(id)
         }
+    }
+
+    private fun setActive(active: Boolean, result: MethodChannel.Result) {
+        isActive = active
+        result.success(null)
     }
 
     // ─── Photo Capture ────────────────────────────────────────────────
 
     private fun takePhoto(options: Map<String, Any>, result: MethodChannel.Result) {
         val safeResult = SafeResult(result)
-        val camera = cameraDevice ?: run {
-            safeResult.error("CAMERA_ERROR", "Camera not initialized", null)
-            return
-        }
-        val session = captureSession ?: run {
-            safeResult.error("CAMERA_ERROR", "Capture session not ready", null)
-            return
-        }
-        val reader = photoReader ?: run {
-            safeResult.error("CAMERA_ERROR", "Photo reader not ready", null)
+        val capture = imageCapture ?: run {
+            safeResult.error("CAMERA_ERROR", "ImageCapture not initialized", null)
             return
         }
 
-        val flash = options["flash"] as? String ?: "off"
-        val enableHdr = options["enableHdr"] as? Boolean ?: false
         val path = options["path"] as? String
-        val location = options["location"] as? Map<String, Any>
-
-        val rotation = physicalOrientation
-
-        val captureRequest = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-            addTarget(reader.surface)
-            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-            set(CaptureRequest.FLASH_MODE, if (flash == "on") CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
-            
-            val manager = cameraManager!!
-            val chars = manager.getCameraCharacteristics(camera.id)
-            val orientation = getJpegOrientation(chars, rotation)
-            set(CaptureRequest.JPEG_ORIENTATION, orientation)
-            Log.i("CameraPlugin", "Photo JPEG Orientation: $orientation (physical: $rotation)")
-            
-            if (enableHdr) {
-                set(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_HDR)
-                set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_USE_SCENE_MODE)
-            }
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                set(CaptureRequest.CONTROL_ZOOM_RATIO, lastZoom)
-            }
+        val file = if (path != null) {
+            File(path, "photo_${System.currentTimeMillis()}.jpg")
+        } else {
+            File(context.cacheDir, "photo_${System.currentTimeMillis()}.jpg")
         }
 
-        reader.setOnImageAvailableListener({ reader ->
-            val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-            
-            val buffer = image.planes[0].buffer
-            val bytes = ByteArray(buffer.remaining())
-            buffer.get(bytes)
-            image.close()
+        val outputOptions = ImageCapture.OutputFileOptions.Builder(file).build()
 
-            try {
-                val file = if (path != null) {
-                    File(path, "photo_${System.currentTimeMillis()}.jpg")
-                } else {
-                    File(context.cacheDir, "photo_${System.currentTimeMillis()}.jpg")
-                }
-
-                val manager = cameraManager!!
-                val chars = manager.getCameraCharacteristics(camera.id)
-                val isFrontCamera = chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
-
-                val finalBitmap = if (isFrontCamera) {
-                    val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                    if (bitmap != null) {
-                        val matrix = Matrix()
-                        val rotationDegrees = getJpegOrientation(chars, rotation)
-                        matrix.postRotate(rotationDegrees.toFloat())
-                        matrix.postScale(-1.0f, 1.0f)
-                        
-                        val processed = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-                        bitmap.recycle()
-                        processed
-                    } else null
-                } else null
-
-                if (finalBitmap != null) {
-                    FileOutputStream(file).use { finalBitmap.compress(Bitmap.CompressFormat.JPEG, 95, it) }
-                } else {
-                    FileOutputStream(file).use { it.write(bytes) }
-                }
-                
-                location?.let {
-                    try {
-                        val exif = ExifInterface(file.absolutePath)
-                        val lat = it["latitude"] as? Double ?: 0.0
-                        val lon = it["longitude"] as? Double ?: 0.0
-                        exif.setLatLong(lat, lon)
-                        if (it.containsKey("altitude")) {
-                            exif.setAttribute(ExifInterface.TAG_GPS_ALTITUDE, it["altitude"].toString())
-                        }
-                        exif.saveAttributes()
-                    } catch (e: Exception) {
-                        Log.e("CameraPlugin", "EXIF Error: ${e.message}")
-                    }
-                }
-
-                activity?.runOnUiThread {
-                    val w = finalBitmap?.width ?: reader.width
-                    val h = finalBitmap?.height ?: reader.height
-                    finalBitmap?.recycle()
-                    
-                    // Clear the listener so we don't catch extra frames
-                    reader.setOnImageAvailableListener(null, null)
-                    
+        capture.takePicture(outputOptions, cameraExecutor, object : ImageCapture.OnImageSavedCallback {
+            override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                mainHandler.post {
                     safeResult.success(mapOf(
                         "path" to file.absolutePath,
-                        "width" to w,
-                        "height" to h,
-                        "isRawPhoto" to false,
-                        "orientation" to if (h > w) "portrait" else "landscape-left",
+                        "width" to (currentFormat?.get("photoWidth") ?: 1920),
+                        "height" to (currentFormat?.get("photoHeight") ?: 1080),
+                        "orientation" to "portrait",
                         "isMirrored" to isFrontCamera
                     ))
                 }
-            } catch (e: Exception) {
-                activity?.runOnUiThread {
-                    reader.setOnImageAvailableListener(null, null)
-                    safeResult.error("CAPTURE_ERROR", "Failed to save photo: ${e.message}", null)
+            }
+
+            override fun onError(exception: ImageCaptureException) {
+                mainHandler.post {
+                    safeResult.error("CAPTURE_ERROR", "Failed to capture photo: ${exception.message}", null)
                 }
             }
-        }, backgroundHandler)
-
-        try {
-            session.capture(captureRequest.build(), null, backgroundHandler)
-        } catch (e: Exception) {
-            photoReader?.setOnImageAvailableListener(null, null)
-            safeResult.error("CAPTURE_ERROR", "Failed to trigger capture: ${e.message}", null)
-        }
+        })
     }
 
     // ─── Video Recording ──────────────────────────────────────────────
 
     private fun startRecording(path: String?, flash: String, fileType: String, result: MethodChannel.Result) {
         val safeResult = SafeResult(result)
-        val camera = cameraDevice ?: run {
-            safeResult.error("CAMERA_ERROR", "Camera not initialized", null)
+        val capture = videoCapture ?: run {
+            safeResult.error("CAMERA_ERROR", "VideoCapture not initialized", null)
             return
         }
-        
-        videoWidth = currentFormat?.get("videoWidth") as? Int ?: 1920
-        videoHeight = currentFormat?.get("videoHeight") as? Int ?: 1080
+
         val outputFilePath = path ?: File(context.cacheDir, "video_${System.currentTimeMillis()}.mp4").absolutePath
         videoPath = outputFilePath
+        
+        // Torch control via cameraControl
+        camera?.cameraControl?.enableTorch(flash == "on")
+        lastTorchMode = flash
 
-        val rotation = physicalOrientation // Use real physical rotation instead of UI lock
+        val file = File(outputFilePath)
+        val outOptions = FileOutputOptions.Builder(file).build()
 
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                mediaRecorder = MediaRecorder(context)
-            } else {
-                @Suppress("DEPRECATION")
-                mediaRecorder = MediaRecorder()
-            }
-
-            val manager = cameraManager!!
-            val chars = manager.getCameraCharacteristics(camera.id)
-            val orientationHint = getJpegOrientation(chars, rotation)
-            Log.i("CameraPlugin", "Starting recording with orientationHint: $orientationHint (using physicalOrientation: $rotation)")
-
-            mediaRecorder?.apply {
-                setAudioSource(MediaRecorder.AudioSource.MIC)
-                setVideoSource(MediaRecorder.VideoSource.SURFACE)
-                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                setVideoEncodingBitRate(10000000)
-                setVideoFrameRate(30)
-                setVideoSize(videoWidth, videoHeight)
-                setOrientationHint(orientationHint)
-                setOutputFile(outputFilePath)
-                prepare()
-            }
-
-            val videoSurface = mediaRecorder!!.surface
-            
-            // Reconfigure session to include video surface
-            val surfaces = mutableListOf(previewSurface!!, videoSurface)
-            photoReader?.let { surfaces.add(it.surface) }
-            frameReader?.let { surfaces.add(it.surface) }
-
-            lastTorchMode = flash
-
-            val stateCallback = object : CameraCaptureSession.StateCallback() {
-                override fun onConfigured(session: CameraCaptureSession) {
-                    captureSession = session
-                    try {
-                        updateRepeatingRequest()
-                        mediaRecorder?.start()
+        activeRecording = capture.output
+            .prepareRecording(context, outOptions)
+            .withAudioEnabled()
+            .start(cameraExecutor) { event ->
+                when (event) {
+                    is VideoRecordEvent.Start -> {
                         recordingStartTime = System.currentTimeMillis()
-                        safeResult.success(null)
-                    } catch (e: Exception) {
-                        safeResult.error("RECORD_ERROR", "Failed to start recording: ${e.message}", null)
+                        mainHandler.post { safeResult.success(null) }
+                    }
+                    is VideoRecordEvent.Finalize -> {
+                        if (event.hasError()) {
+                            Log.e("CameraPlugin", "Video recording error: ${event.error}")
+                            // Handle error if needed
+                        }
+                        val duration = (event.recordingStats.recordedDurationNanos / 1e9)
+                        val metadata = mapOf(
+                            "path" to (videoPath ?: ""),
+                            "duration" to duration,
+                            "width" to (currentFormat?.get("videoWidth") ?: 1920),
+                            "height" to (currentFormat?.get("videoHeight") ?: 1080)
+                        )
+                        mainHandler.post {
+                            pendingVideoResult?.success(metadata)
+                            pendingVideoResult = null
+                        }
                     }
                 }
-
-                override fun onConfigureFailed(session: CameraCaptureSession) {
-                    safeResult.error("RECORD_ERROR", "Failed to configure video session", null)
-                }
             }
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                val outputConfigs = surfaces.map { OutputConfiguration(it) }
-                camera.createCaptureSession(SessionConfiguration(
-                    SessionConfiguration.SESSION_REGULAR, 
-                    outputConfigs, 
-                    mainExecutor, 
-                    stateCallback
-                ))
-            } else {
-                @Suppress("DEPRECATION")
-                camera.createCaptureSession(surfaces, stateCallback, backgroundHandler)
-            }
-
-        } catch (e: Exception) {
-            safeResult.error("RECORD_ERROR", "Failed to prepare recorder: ${e.message}", null)
-        }
     }
 
     private fun stopRecording(result: MethodChannel.Result) {
-        val safeResult = SafeResult(result)
-        try {
-            mediaRecorder?.apply {
-                stop()
-                reset()
-                release()
-            }
-            mediaRecorder = null
-            
-            val duration = (System.currentTimeMillis() - recordingStartTime) / 1000.0
-            val metadata = mapOf(
-                "path" to (videoPath ?: ""),
-                "duration" to duration,
-                "width" to videoWidth,
-                "height" to videoHeight
-            )
-            revertToPreview(safeResult, metadata)
-        } catch (e: Exception) {
-            safeResult.error("RECORD_ERROR", "Failed to stop recording: ${e.message}", null)
-        }
-    }
-
-    private fun cancelRecording(result: MethodChannel.Result) {
-        val safeResult = SafeResult(result)
-        try {
-            mediaRecorder?.apply {
-                stop()
-                reset()
-                release()
-            }
-            mediaRecorder = null
-            videoPath?.let { File(it).delete() }
-            revertToPreview(safeResult, null)
-        } catch (e: Exception) {
-            safeResult.error("RECORD_ERROR", "Failed to cancel recording: ${e.message}", null)
-        }
-    }
-
-    private fun revertToPreview(result: SafeResult, finalMetadata: Map<String, Any>?) {
-        val camera = cameraDevice
-        val producer = surfaceProducer
-        if (camera != null && producer != null) {
-            createPreviewSession(camera, producer, currentFormat, object : MethodChannel.Result {
-                override fun success(res: Any?) {
-                    result.success(finalMetadata)
-                }
-                override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {
-                    result.error(errorCode, errorMessage, errorDetails)
-                }
-                override fun notImplemented() {
-                    result.notImplemented()
-                }
-            })
-        } else {
-            result.success(finalMetadata)
-        }
+        pendingVideoResult = result
+        activeRecording?.stop()
+        activeRecording = null
     }
 
     private fun pauseRecording(result: MethodChannel.Result) {
-        val safeResult = SafeResult(result)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            try {
-                mediaRecorder?.pause()
-                safeResult.success(null)
-            } catch (e: Exception) {
-                safeResult.error("RECORD_ERROR", "Failed to pause recording: ${e.message}", null)
-            }
-        } else {
-            safeResult.error("UNSUPPORTED", "Pause recording requires Android 7.0+", null)
-        }
+        activeRecording?.pause()
+        result.success(null)
     }
 
     private fun resumeRecording(result: MethodChannel.Result) {
-        val safeResult = SafeResult(result)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            try {
-                mediaRecorder?.resume()
-                safeResult.success(null)
-            } catch (e: Exception) {
-                safeResult.error("RECORD_ERROR", "Failed to resume recording: ${e.message}", null)
-            }
-        } else {
-            safeResult.error("UNSUPPORTED", "Resume recording requires Android 7.0+", null)
-        }
+        activeRecording?.resume()
+        result.success(null)
     }
 
+    private fun cancelRecording(result: MethodChannel.Result) {
+        val path = videoPath
+        activeRecording?.stop()
+        activeRecording = null
+        path?.let { File(it).delete() }
+        result.success(null)
+    }
 
-    // ─── Code Scanner ─────────────────────────────────────────────────
+    // ─── Controls ─────────────────────────────────────────────────────
+
+    private fun setZoom(zoom: Double, result: MethodChannel.Result) {
+        camera?.cameraControl?.setZoomRatio(zoom.toFloat())
+        lastZoom = zoom.toFloat()
+        result.success(null)
+    }
+
+    private fun setTorch(mode: String, result: MethodChannel.Result) {
+        camera?.cameraControl?.enableTorch(mode == "on")
+        lastTorchMode = mode
+        result.success(null)
+    }
+
+    private fun setExposure(exposure: Double, result: MethodChannel.Result) {
+        camera?.cameraControl?.setExposureCompensationIndex(exposure.toInt())
+        lastExposure = exposure.toInt()
+        result.success(null)
+    }
+
+    private fun focus(x: Double, y: Double, result: MethodChannel.Result) {
+        val videoWidth = currentFormat?.get("videoWidth") as? Int ?: 1920
+        val videoHeight = currentFormat?.get("videoHeight") as? Int ?: 1080
+        
+        val factory = SurfaceOrientedMeteringPointFactory(videoWidth.toFloat(), videoHeight.toFloat())
+        val point = factory.createPoint(x.toFloat(), y.toFloat())
+        val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
+            .setAutoCancelDuration(5, TimeUnit.SECONDS)
+            .build()
+        
+        camera?.cameraControl?.startFocusAndMetering(action)
+        result.success(null)
+    }
+
+    private fun setFocusDistance(distance: Double, result: MethodChannel.Result) {
+        // CameraX does not provide direct "manual focal distance" API in diopters like Camera2 easily
+        // Usually handled via Camera2Interop if needed.
+        result.notImplemented()
+    }
+
+    // ─── Code Scanner Utilities ────────────────────────────────────────
 
     private fun getMlKitRotation(): Int {
-        val deviceId = activeDeviceId ?: return 0
-        val chars = cameraManager?.getCameraCharacteristics(deviceId) ?: return 0
-        val sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
-        
-        // physicalOrientation is set by OrientationEventListener as Surface.ROTATION_0, 90, 180, 270
-        val rotationDegrees = when (physicalOrientation) {
-            Surface.ROTATION_0 -> 0
-            Surface.ROTATION_90 -> 90
-            Surface.ROTATION_180 -> 180
-            Surface.ROTATION_270 -> 270
-            else -> 0
-        }
-
-        return if (isFrontCamera) {
-            (sensorOrientation + rotationDegrees) % 360
-        } else {
-            (sensorOrientation - rotationDegrees + 360) % 360
-        }
+        return camera?.cameraInfo?.sensorRotationDegrees ?: 0
     }
 
     private fun barcodeFormatToString(format: Int): String {
@@ -1056,14 +844,12 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
 
     private fun updateCodeScanner(config: Map<String, Any>?) {
         if (config == null) {
-            Log.d("CameraPlugin", "Disabling code scanner")
             isCodeScannerEnabled = false
             barcodeScanner?.close()
             barcodeScanner = null
             return
         }
 
-        Log.d("CameraPlugin", "Enabling code scanner with config: $config")
         isCodeScannerEnabled = true
         val types = config["codeTypes"] as? List<String>
         val builder = BarcodeScannerOptions.Builder()
@@ -1107,36 +893,9 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
     // ─── Snapshot ─────────────────────────────────────────────────────
 
     private fun takeSnapshot(result: MethodChannel.Result) {
-        val reader = frameReader ?: run {
-            result.error("CAMERA_ERROR", "Frame reader not ready", null)
-            return
-        }
-
-        // For absolute simplicity in this stub, we take the last frame from frameReader
-        // and save it as a JPEG. In a real app, you might want a higher res snapshot.
-        val image = reader.acquireLatestImage() ?: run {
-             result.error("CAPTURE_ERROR", "No frame available for snapshot", null)
-             return
-        }
-
-        val buffer = image.planes[0].buffer
-        val bytes = ByteArray(buffer.remaining())
-        buffer.get(bytes)
-        image.close()
-
-        val file = File(context.cacheDir, "snapshot_${System.currentTimeMillis()}.jpg")
-        try {
-            FileOutputStream(file).use { it.write(bytes) }
-            result.success(mapOf(
-                "path" to file.absolutePath,
-                "width" to 1280,
-                "height" to 720,
-                "orientation" to "portrait",
-                "isMirrored" to false
-            ))
-        } catch (e: Exception) {
-            result.error("CAPTURE_ERROR", "Failed to save snapshot: ${e.message}", null)
-        }
+        // In CameraX, we can't easily "steal" a frame from the pipeline without complex setup
+        // Mark as not implemented as per request if complex.
+        result.error("NOT_IMPLEMENTED", "takeSnapshot is not implemented in CameraX yet", null)
     }
 
     // ─── Permissions ───────────────────────────────────────────────────
@@ -1180,376 +939,36 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
             return
         }
         ActivityCompat.requestPermissions(act, arrayOf(Manifest.permission.RECORD_AUDIO), CAMERA_PERMISSION_REQUEST + 1)
-        result.success("granted") // Simplified.
+        result.success("granted") 
     }
 
-    // ─── Lifecycle ─────────────────────────────────────────────────────
-
-    private fun setActive(isActive: Boolean, result: MethodChannel.Result) {
-        val safeResult = SafeResult(result)
-        this.isActive = isActive
-        if (isActive) {
-            updateRepeatingRequest()
-        } else {
-            captureSession?.stopRepeating()
-        }
-        safeResult.success(null)
-    }
-
-    private fun setZoom(zoom: Double, result: MethodChannel.Result) {
-        val safeResult = SafeResult(result)
-        if (cameraDevice == null || captureSession == null) {
-            safeResult.error("CAMERA_ERROR", "Camera not ready", null)
-            return
-        }
-        lastZoom = zoom.toFloat()
-        updateRepeatingRequest()
-
-        // Debounce focus trigger during rapid zoom transitions
-        backgroundHandler?.removeCallbacks(afTriggerRunnable)
-        backgroundHandler?.postDelayed(afTriggerRunnable, 300)
-
-        safeResult.success(null)
-    }
-
-    private val afTriggerRunnable = Runnable {
-        if (Math.abs(lastZoom - lastAFTriggerZoom) > 0.1f && !isManualFocusActive) {
-            lastAFTriggerZoom = lastZoom
-            triggerAutoFocus()
-        }
-    }
-
-    private fun triggerAutoFocus() {
-        val camera = cameraDevice ?: return
-        val session = captureSession ?: return
-        val surface = previewSurface ?: return
-        try {
-            // 1. Cancel previous AF state machine
-            val cancelBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-            cancelBuilder.addTarget(surface)
-            mediaRecorder?.surface?.let { cancelBuilder.addTarget(it) }
-            
-            cancelBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_CANCEL)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                cancelBuilder.set(CaptureRequest.CONTROL_ZOOM_RATIO, lastZoom)
-            }
-            session.capture(cancelBuilder.build(), null, backgroundHandler)
-
-            // 2. Immediate trigger
-            val triggerBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-            triggerBuilder.addTarget(surface)
-            mediaRecorder?.surface?.let { triggerBuilder.addTarget(it) }
-            
-            triggerBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-            triggerBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                triggerBuilder.set(CaptureRequest.CONTROL_ZOOM_RATIO, lastZoom)
-            }
-            session.capture(triggerBuilder.build(), null, backgroundHandler)
-        } catch (e: Exception) {
-            Log.e("CameraPlugin", "Auto focus trigger failed", e)
-        }
-    }
-
-    private fun setTorch(mode: String, result: MethodChannel.Result) {
-        val safeResult = SafeResult(result)
-        if (cameraDevice == null || captureSession == null) {
-            safeResult.error("CAMERA_ERROR", "Camera not ready", null)
-            return
-        }
-        lastTorchMode = mode
-        updateRepeatingRequest()
-        safeResult.success(null)
-    }
-
-    private fun setExposure(exposure: Double, result: MethodChannel.Result) {
-        val safeResult = SafeResult(result)
-        if (cameraDevice == null || captureSession == null) {
-            safeResult.error("CAMERA_ERROR", "Camera not ready", null)
-            return
-        }
-        lastExposure = exposure.toInt()
-        updateRepeatingRequest()
-        safeResult.success(null)
-    }
-
-
-
-    private fun setFocusDistance(distance: Double, result: MethodChannel.Result) {
-        val safeResult = SafeResult(result)
-        val session = captureSession ?: run {
-            safeResult.error("CAMERA_ERROR", "Capture session not ready", null)
-            return
-        }
-        
-        // Map distance (0.0 - 1.0) to (Infinity - minFocusDistance)
-        // Camera2 focus distance is in diopters (1/m). 0 is infinity.
-        val manager = cameraManager!!
-        val chars = manager.getCameraCharacteristics(cameraDevice!!.id)
-        val minDistance = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0.0f
-        
-        val lensPosition = (distance * minDistance).toFloat()
-        
-        try {
-            val request = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                addTarget(previewSurface!!)
-                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
-                set(CaptureRequest.LENS_FOCUS_DISTANCE, lensPosition)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    set(CaptureRequest.CONTROL_ZOOM_RATIO, lastZoom)
-                }
-            }
-            session.setRepeatingRequest(request.build(), null, backgroundHandler)
-            safeResult.success(null)
-        } catch (e: Exception) {
-            safeResult.error("CAMERA_ERROR", "Failed to set focus distance: ${e.message}", null)
-        }
-    }
-
-    private fun focus(x: Double, y: Double, result: MethodChannel.Result) {
-        val safeResult = SafeResult(result)
-        val camera = cameraDevice ?: return
-        val session = captureSession ?: run {
-            safeResult.error("CAMERA_ERROR", "Capture session not ready", null)
-            return
-        }
-        try {
-            val characteristics = cameraManager!!.getCameraCharacteristics(camera.id)
-            val arraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)!!
-            val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
-            
-            // Precise coordinate mapping from 0..1 to sensor coordinates
-            var sensorX = 0
-            var sensorY = 0
-            
-            when (sensorOrientation) {
-                90 -> {
-                    sensorX = (y * arraySize.width()).toInt()
-                    sensorY = ((1.0 - x) * arraySize.height()).toInt()
-                }
-                270 -> {
-                    sensorX = ((1.0 - y) * arraySize.width()).toInt()
-                    sensorY = (x * arraySize.height()).toInt()
-                }
-                180 -> {
-                    sensorX = ((1.0 - x) * arraySize.width()).toInt()
-                    sensorY = ((1.0 - y) * arraySize.height()).toInt()
-                }
-                else -> { // 0 or other
-                    sensorX = (x * arraySize.width()).toInt()
-                    sensorY = (y * arraySize.height()).toInt()
-                }
-            }
-            
-            val halfSize = 120 // Slightly larger area for better reliability
-            val focusRect = Rect(
-                Math.max(0, sensorX - halfSize),
-                Math.max(0, sensorY - halfSize),
-                Math.min(arraySize.width(), sensorX + halfSize),
-                Math.min(arraySize.height(), sensorY + halfSize)
-            )
-            
-            val metering = MeteringRectangle(focusRect, MeteringRectangle.METERING_WEIGHT_MAX)
-            
-            // 1. Cancel previous AF state machine
-            val cancelBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-            cancelBuilder.addTarget(previewSurface!!)
-            mediaRecorder?.surface?.let { cancelBuilder.addTarget(it) } // Crucial: avoid flickering in recording
-            
-            cancelBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_CANCEL)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                cancelBuilder.set(CaptureRequest.CONTROL_ZOOM_RATIO, lastZoom) // Crucial: avoid flickering when zoomed
-            }
-            session.capture(cancelBuilder.build(), null, backgroundHandler)
-
-            // 2. Trigger new focus request
-            val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-            builder.addTarget(previewSurface!!)
-            mediaRecorder?.surface?.let { builder.addTarget(it) }
-            
-            builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(metering))
-            builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(metering))
-            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
-            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
-            builder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_START)
-            
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, lastZoom)
-            }
-            builder.set(CaptureRequest.FLASH_MODE, if (lastTorchMode == "on") CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
-
-            isManualFocusActive = true
-            session.capture(builder.build(), null, backgroundHandler)
-            
-            // Resume repeating with AF_MODE_AUTO to hold focus
-            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
-            builder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_IDLE)
-            session.setRepeatingRequest(builder.build(), null, backgroundHandler)
-            
-            // Revert to continuous AF after 5 seconds
-            backgroundHandler?.postDelayed({
-                isManualFocusActive = false
-                updateRepeatingRequest()
-            }, 5000)
-
-            safeResult.success(null)
-        } catch (e: Exception) {
-            safeResult.error("CAMERA_ERROR", "Focus failed: ${e.message}", null)
-        }
-    }
-
-    private fun getJpegOrientation(chars: CameraCharacteristics, deviceOrientation: Int): Int {
-        val sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
-        val lensFacing = chars.get(CameraCharacteristics.LENS_FACING)
-
-        // Round device orientation to a multiple of 90
-        val deviceOrientationDegrees = when (deviceOrientation) {
-            Surface.ROTATION_0 -> 0
-            Surface.ROTATION_90 -> 90
-            Surface.ROTATION_180 -> 180
-            Surface.ROTATION_270 -> 270
-            else -> 0
-        }
-
-        val result = if (lensFacing == CameraCharacteristics.LENS_FACING_FRONT) {
-            (sensorOrientation + deviceOrientationDegrees) % 360
-        } else {
-            (sensorOrientation - deviceOrientationDegrees + 360) % 360
-        }
-        
-        Log.i("CameraPlugin", "getJpegOrientation: lensFacing=$lensFacing, sensor=$sensorOrientation, device=$deviceOrientationDegrees, result=$result")
-        return result
-    }
-
-    private fun updateRepeatingRequest() {
-        val camera = cameraDevice ?: return
-        val session = captureSession ?: return
-        val surface = previewSurface ?: return
-
-        try {
-            val template = if (mediaRecorder != null) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
-            val builder = camera.createCaptureRequest(template)
-            
-            builder.addTarget(surface)
-            
-            mediaRecorder?.surface?.let {
-                builder.addTarget(it)
-            }
-            
-            if (isFrameProcessorEnabled || isCodeScannerEnabled) {
-                frameReader?.surface?.let {
-                    builder.addTarget(it)
-                }
-            }
-
-            // Apply zoom
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, lastZoom)
-            }
-            
-            // Apply torch
-            builder.set(CaptureRequest.FLASH_MODE, if (lastTorchMode == "on") CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
-            
-            // Apply exposure
-            builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, lastExposure)
-            
-            // Apply continuous AF for smoothness, unless manual focus is active
-            if (!isManualFocusActive) {
-                // Use CONTINUOUS_PICTURE for more aggressive/faster focus in vision apps
-                builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-            } else {
-                builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
-            }
-
-            val request = builder.build()
-            session.setRepeatingRequest(request, null, backgroundHandler)
-        } catch (e: Exception) {
-            Log.e("CameraPlugin", "Failed to update repeating request", e)
-        }
-    }
-
-    private fun startBackgroundThread() {
-        if (backgroundThread != null) return
-        backgroundThread = HandlerThread("CameraBackground").also { it.start() }
-        backgroundHandler = Handler(backgroundThread!!.looper)
-    }
+    // ─── Lifecycle & Cleanup ──────────────────────────────────────────
 
     private fun releaseCamera(stopThread: Boolean = true) {
-        Log.d("CameraPlugin", "Releasing camera and resources (stopThread=$stopThread)")
+        Log.d("CameraPlugin", "Releasing camera and resources")
         
         isActive = false
-        isFrameProcessorEnabled = false
-        isCodeScannerEnabled = false
         isProcessingCode.set(false)
-        isManualFocusActive = false
 
-        // Cancel any pending focus resets
-        backgroundHandler?.removeCallbacksAndMessages(null)
+        activeRecording?.stop()
+        activeRecording = null
 
-        // Stop receiving new images
-        try {
-            frameReader?.setOnImageAvailableListener(null, null)
-            photoReader?.setOnImageAvailableListener(null, null)
-        } catch (e: Exception) { /* ignore */ }
-
-        // Clear any pending frames
         FlutterNativeVisionCameraPlugin.clearFrames()
 
         try {
-            captureSession?.abortCaptures()
-            captureSession?.stopRepeating()
-        } catch (e: Exception) { /* ignore */ }
-        
-        try {
-            captureSession?.close()
-        } catch (e: Exception) { /* ignore */ }
-        captureSession = null
-        
-        try {
-            cameraDevice?.close()
-        } catch (e: Exception) { /* ignore */ }
-        cameraDevice = null
-        
-        mediaRecorder?.apply {
-            try {
-                stop()
-            } catch (e: Exception) { /* ignore if not recording */ }
-            try {
-                reset()
-            } catch (e: Exception) { /* ignore */ }
-            try {
-                release()
-            } catch (e: Exception) { /* ignore */ }
+            cameraProvider?.unbindAll()
+        } catch (e: Exception) {
+            Log.e("CameraPlugin", "Error unbinding CameraX: ${e.message}")
         }
-        mediaRecorder = null
-
-        try {
-            previewSurface?.release()
-        } catch (e: Exception) { /* ignore */ }
-        previewSurface = null
         
-        try {
-            surfaceProducer?.release()
-        } catch (e: Exception) { /* ignore */ }
+        preview = null
+        imageAnalysis = null
+        imageCapture = null
+        videoCapture = null
+        camera = null
+        
+        surfaceProducer?.release()
         surfaceProducer = null
-        
-        try {
-            photoReader?.close()
-        } catch (e: Exception) { /* ignore */ }
-        photoReader = null
-        
-        try {
-            frameReader?.close()
-        } catch (e: Exception) { /* ignore */ }
-        frameReader = null
-
-        if (stopThread) {
-            try {
-                backgroundThread?.quitSafely()
-            } catch (e: Exception) { /* ignore */ }
-            backgroundThread = null
-            backgroundHandler = null
-        }
     }
 
     /**

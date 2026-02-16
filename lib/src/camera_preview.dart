@@ -54,25 +54,16 @@ class CameraPreview extends StatelessWidget {
       return const ColoredBox(color: Colors.black);
     }
 
-    final orientation =
-        controller.device?.sensorOrientation ?? Orientation.portrait;
-    final sensorOrientation = orientation.degrees;
-
-    // The dimensions from the native stream (usually landscape buffer)
+    // The dimensions from the native stream
+    // Since we set targetRotation in CameraX, these dimensions already
+    // reflect the correct orientation for the current display.
     final nativeWidth = controller.previewWidth?.toDouble() ?? 1920.0;
     final nativeHeight = controller.previewHeight?.toDouble() ?? 1080.0;
 
-    // We rotate the texture based on sensor orientation to make it upright.
-    // Most Android sensors are 90 degrees (landscape).
-    final turns = (sensorOrientation / 90).round();
-
-    Widget previewWidget = RotatedBox(
-      quarterTurns: turns,
-      child: SizedBox(
-        width: nativeWidth,
-        height: nativeHeight,
-        child: Texture(textureId: textureId),
-      ),
+    Widget previewWidget = SizedBox(
+      width: nativeWidth,
+      height: nativeHeight,
+      child: Texture(textureId: textureId),
     );
 
     final fit = resizeMode == ResizeMode.cover ? BoxFit.cover : BoxFit.contain;
