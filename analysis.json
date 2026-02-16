@@ -1,0 +1,8 @@
+[warning] Unused import: 'src/camera_controller.dart' (C:\Users\jente\Development\FlutterNativeVisionCamera\project\flutter_native_camera_vision\flutter_native_vision_camera\lib\flutter_native_vision_camera.dart:12:8)
+[info] Dangling library doc comment (C:\Users\jente\Development\FlutterNativeVisionCamera\project\flutter_native_camera_vision\flutter_native_vision_camera\lib\flutter_native_vision_camera.dart:1:1)
+[error] This expression has a type of 'void' so its value can't be used (C:\Users\jente\Development\FlutterNativeVisionCamera\project\flutter_native_camera_vision\flutter_native_vision_camera\lib\src\camera_controller.dart:163:36)
+[warning] The value of the field '_codeScannerConfiguration' isn't used (C:\Users\jente\Development\FlutterNativeVisionCamera\project\flutter_native_camera_vision\flutter_native_vision_camera\lib\src\camera_controller.dart:33:29)
+[info] Uses 'await' on an instance of 'void', which is not a subtype of 'Future' (C:\Users\jente\Development\FlutterNativeVisionCamera\project\flutter_native_camera_vision\flutter_native_vision_camera\lib\src\camera_controller.dart:163:5)
+[warning] Unused import: 'package:ffi/ffi.dart' (C:\Users\jente\Development\FlutterNativeVisionCamera\project\flutter_native_camera_vision\flutter_native_vision_camera\lib\src\frame.dart:4:8)
+[error] The function 'sum' isn't defined (C:\Users\jente\Development\FlutterNativeVisionCamera\project\flutter_native_camera_vision\flutter_native_vision_camera\example\lib\main.dart:24:46)
+[error] The function 'sumAsync' isn't defined (C:\Users\jente\Development\FlutterNativeVisionCamera\project\flutter_native_camera_vision\flutter_native_vision_camera\example\lib\main.dart:25:51)
