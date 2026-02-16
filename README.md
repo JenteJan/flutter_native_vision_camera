@@ -103,6 +103,7 @@ ValueListenableBuilder<CameraState>(
     return Texture(textureId: controller.textureId!);
   },
 )
+```
 
 ### Lifecycle Management
 
