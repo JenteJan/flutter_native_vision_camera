@@ -138,12 +138,24 @@ public class SwiftFlutterNativeVisionCameraPlugin: NSObject, FlutterPlugin {
     // MARK: - Device Discovery
 
     private func getAvailableCameraDevices(result: @escaping FlutterResult) {
+        var deviceTypes: [AVCaptureDevice.DeviceType] = [
+            .builtInWideAngleCamera,
+            .builtInTelephotoCamera,
+            .builtInUltraWideCamera,
+        ]
+        
+        // Add more device types for better discovery and simulator support
+        if #available(iOS 13.0, *) {
+            deviceTypes.append(.builtInDualCamera)
+            deviceTypes.append(.builtInTripleCamera)
+            deviceTypes.append(.builtInDualWideCamera)
+        }
+        
+        // Simulators and external cameras
+        deviceTypes.append(.externalUnknown)
+        
         let discoverySession = AVCaptureDevice.DiscoverySession(
-            deviceTypes: [
-                .builtInWideAngleCamera,
-                .builtInTelephotoCamera,
-                .builtInUltraWideCamera,
-            ],
+            deviceTypes: deviceTypes,
             mediaType: .video,
             position: .unspecified
         )
@@ -282,9 +294,21 @@ public class SwiftFlutterNativeVisionCameraPlugin: NSObject, FlutterPlugin {
                 renderer.textureRegistry = self.textureRegistry
                 renderer.textureId = textureId
 
-                session.startRunning()
-
-                result(["textureId": textureId])
+                let format = device.activeFormat
+                let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+                
+                // Start session in background
+                self.sessionQueue.async {
+                    session.startRunning()
+                    
+                    DispatchQueue.main.async {
+                        result([
+                            "textureId": textureId,
+                            "previewWidth": Int(dims.width),
+                            "previewHeight": Int(dims.height)
+                        ])
+                    }
+                }
             }
         }
     }

@@ -19,6 +19,7 @@ class _NativeCameraPageState extends State<NativeCameraPage>
   CameraDevice? _currentDevice;
   CameraDeviceFormat? _currentFormat;
   bool _isInitialized = false;
+  String? _error;
 
   double _zoom = 1.0;
   String? _lastMediaPath;
@@ -56,18 +57,37 @@ class _NativeCameraPageState extends State<NativeCameraPage>
   }
 
   Future<void> _initialize() async {
-    final camStatus = await CameraPermissions.requestCameraPermission();
-    if (camStatus != PermissionStatus.granted) return;
+    try {
+      final camStatus = await CameraPermissions.requestCameraPermission();
+      if (camStatus != PermissionStatus.granted) {
+        if (mounted) {
+          setState(() => _error = "Camera permission denied.");
+        }
+        return;
+      }
 
-    final devices = await CameraDevices.getAvailableCameraDevices();
-    if (devices.isEmpty) return;
+      final devices = await CameraDevices.getAvailableCameraDevices();
+      if (devices.isEmpty) {
+        if (mounted) {
+          setState(
+            () => _error =
+                "No camera devices found. (If on simulator, check settings)",
+          );
+        }
+        return;
+      }
 
-    _devices = devices;
-    _currentDevice =
-        CameraDevices.getCameraDevice(devices, CameraPosition.back) ??
-        devices.first;
+      _devices = devices;
+      _currentDevice =
+          CameraDevices.getCameraDevice(devices, CameraPosition.back) ??
+          devices.first;
 
-    await _startCamera();
+      await _startCamera();
+    } catch (e) {
+      if (mounted) {
+        setState(() => _error = "Initialization failed: $e");
+      }
+    }
   }
 
   Future<void> _startCamera() async {
@@ -185,6 +205,40 @@ class _NativeCameraPageState extends State<NativeCameraPage>
 
   @override
   Widget build(BuildContext context) {
+    if (_error != null) {
+      return Scaffold(
+        backgroundColor: Colors.black,
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24.0),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(
+                  Icons.error_outline,
+                  color: Colors.redAccent,
+                  size: 64,
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  _error!,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white, fontSize: 16),
+                ),
+                const SizedBox(height: 32),
+                ElevatedButton(
+                  onPressed: () {
+                    setState(() => _error = null);
+                    _initialize();
+                  },
+                  child: const Text("Retry"),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
     return ValueListenableBuilder<CameraState>(
       valueListenable: _controller,
       builder: (context, state, _) {
