@@ -6,7 +6,7 @@ import Vision
 ///
 /// Uses AVFoundation for camera access, FlutterTextureRegistry for
 /// zero-copy GPU preview, and FlutterMethodChannel for control commands.
-public class FlutterNativeVisionCameraPlugin: NSObject, FlutterPlugin {
+public class SwiftFlutterNativeVisionCameraPlugin: NSObject, FlutterPlugin {
 
     private var channel: FlutterMethodChannel!
     private var textureRegistry: FlutterTextureRegistry!
@@ -18,7 +18,7 @@ public class FlutterNativeVisionCameraPlugin: NSObject, FlutterPlugin {
     private var isFrameProcessorEnabled = false
     private var textureId: Int64?
     private var pixelBufferRenderer: PixelBufferRenderer?
-    private var pendingPhotoResult: FlutterResult?
+    fileprivate var pendingPhotoResult: FlutterResult?
     
     private var lastZoom: Float = 1.0
     private var lastAFTriggerZoom: Float = 1.0
@@ -34,7 +34,7 @@ public class FlutterNativeVisionCameraPlugin: NSObject, FlutterPlugin {
             name: "dev.jentejan.flutter_native_vision_camera/camera",
             binaryMessenger: registrar.messenger()
         )
-        let instance = FlutterNativeVisionCameraPlugin()
+        let instance = SwiftFlutterNativeVisionCameraPlugin()
         instance.channel = channel
         instance.textureRegistry = registrar.textures()
         registrar.addMethodCallDelegate(instance, channel: channel)
@@ -93,7 +93,7 @@ public class FlutterNativeVisionCameraPlugin: NSObject, FlutterPlugin {
                 result(FlutterError(code: "INVALID_ARGS", message: "Expected arguments", details: nil))
                 return
             }
-            takePhoto(args: args, result: result)
+            takePhoto(options: args, result: result)
         case "startRecording":
             result(FlutterError(code: "NOT_IMPLEMENTED", message: "Recording not implemented yet", details: nil))
         case "stopRecording":
@@ -240,7 +240,7 @@ public class FlutterNativeVisionCameraPlugin: NSObject, FlutterPlugin {
             session.sessionPreset = .high
 
             do {
-                let input = try AVCaptureDeviceInput(device: captureDevice)
+                let input = try AVCaptureDeviceInput(device: device)
                 if session.canAddInput(input) {
                     session.addInput(input)
                 }
@@ -310,8 +310,8 @@ public class FlutterNativeVisionCameraPlugin: NSObject, FlutterPlugin {
         
         // HDR
         if let enableHdr = options["enableHdr"] as? Swift.Bool, enableHdr {
-            if photoOutput.isAutoPhotoHDRSupported {
-                settings.isAutoPhotoHDREnabled = true
+            if #available(iOS 13.0, *) {
+                settings.photoQualityPrioritization = .quality
             }
         }
 
@@ -483,7 +483,7 @@ public class FlutterNativeVisionCameraPlugin: NSObject, FlutterPlugin {
             }
             
             DispatchQueue.main.async {
-                self?.channel.invokeMethod("onCodeScanned", codes)
+                self?.channel.invokeMethod("onCodeScanned", arguments: codes)
             }
         }
         
@@ -596,10 +596,10 @@ public class FlutterNativeVisionCameraPlugin: NSObject, FlutterPlugin {
 
 // MARK: - AVCapturePhotoCaptureDelegate
 
-extension FlutterNativeVisionCameraPlugin: AVCapturePhotoCaptureDelegate {
+extension SwiftFlutterNativeVisionCameraPlugin: AVCapturePhotoCaptureDelegate {
     public func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
-        guard let result = pendingPhotoResult else { return }
-        pendingPhotoResult = nil
+        guard let result = self.pendingPhotoResult else { return }
+        self.pendingPhotoResult = nil
 
         if let error = error {
             result(FlutterError(code: "CAPTURE_ERROR", message: error.localizedDescription, details: nil))
@@ -617,7 +617,7 @@ extension FlutterNativeVisionCameraPlugin: AVCapturePhotoCaptureDelegate {
 
         do {
             try data.write(to: fileURL)
-            let dims = CMVideoFormatDescriptionGetDimensions(photo.formatDescription)
+            let dims = photo.resolvedSettings.photoDimensions
             result([
                 "path": fileURL.path,
                 "width": Int(dims.width),
@@ -643,7 +643,7 @@ class PixelBufferRenderer: NSObject, FlutterTexture, AVCaptureVideoDataOutputSam
     var textureRegistry: FlutterTextureRegistry?
     var textureId: Int64 = 0
     var isFrameProcessorEnabled = false
-    weak var plugin: FlutterNativeVisionCameraPlugin?
+    weak var plugin: SwiftFlutterNativeVisionCameraPlugin?
     private var latestPixelBuffer: CVPixelBuffer?
 
     func copyPixelBuffer() -> Unmanaged<CVPixelBuffer>? {
@@ -677,8 +677,8 @@ class PixelBufferRenderer: NSObject, FlutterTexture, AVCaptureVideoDataOutputSam
             )
             
             // Retain the buffer so it stays alive during asynchronous FFI processing
-            CFRetain(pixelBuffer)
-            VisionCamera_dispatchFrame(pixelBuffer, metadata)
+            let handle = Unmanaged.passRetained(pixelBuffer).toOpaque()
+            VisionCamera_dispatchFrame(handle, metadata)
         }
         
         plugin?.scanBarcodes(in: pixelBuffer)
