@@ -99,11 +99,14 @@ class Frame {
   /// (startX, startY, endX, endY) are pixel coordinates.
   double computeLuminance(int startX, int startY, int endX, int endY) {
     if (pixelFormat != PixelFormat.yuv) return 0.0;
-    // Use the native function directly on the Y plane pointer
+    // Use the native function directly on the Y plane pointer. The Y plane's
+    // row stride (which may exceed [width] due to hardware padding) is passed
+    // so indexing stays correct.
     return _computeLuminance(
       _getPlanePointer(_pointer, 0).cast<Uint8>(),
       width,
       height,
+      bytesPerRow,
       startX,
       startY,
       endX,
@@ -219,11 +222,12 @@ typedef _ComputeLuminanceFunc =
       Pointer<Uint8> yPlane,
       Int32 width,
       Int32 height,
+      Int32 rowStride,
       Int32 startX,
       Int32 startY,
       Int32 endX,
       Int32 endY,
     );
 typedef _ComputeLuminance =
-    double Function(Pointer<Uint8>, int, int, int, int, int, int);
+    double Function(Pointer<Uint8>, int, int, int, int, int, int, int);
 late _ComputeLuminance _computeLuminance;

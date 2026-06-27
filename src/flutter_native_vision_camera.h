@@ -24,7 +24,7 @@ extern "C"
 #endif
 
     // Opaque handle for a native frame.
-    // Android: NativeFrame struct (id + address)
+    // Android: NativeFrame struct (id + per-plane pointers/strides)
     // iOS: CVPixelBufferRef
     typedef void *FrameHandle;
 
@@ -70,7 +70,7 @@ extern "C"
     FFI_PLUGIN_EXPORT void VisionCamera_setFrameProcessorCallback(FrameProcessorCallback callback);
     FFI_PLUGIN_EXPORT void VisionCamera_dispatchFrame(FrameHandle handle, FrameMetadata metadata);
 
-    FFI_PLUGIN_EXPORT double VisionCamera_computeLuminance(const uint8_t *yPlane, int32_t width, int32_t height, int32_t startX, int32_t startY, int32_t endX, int32_t endY);
+    FFI_PLUGIN_EXPORT double VisionCamera_computeLuminance(const uint8_t *yPlane, int32_t width, int32_t height, int32_t rowStride, int32_t startX, int32_t startY, int32_t endX, int32_t endY);
 
 #ifdef __cplusplus
 }
