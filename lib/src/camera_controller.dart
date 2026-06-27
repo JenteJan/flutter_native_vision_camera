@@ -34,7 +34,8 @@ enum CameraState {
 /// * **Zero-Copy Preview**: Uses `TextureRegistry` for direct GPU rendering.
 /// * **Physical Orientation**: Correctly handles hardware sensor orientation.
 /// * **Integrated ML**: Built-in high-speed Barcode/QR scanning via MLKit.
-/// * **FFI Frame Processing**: Synchronous background frame analysis.
+/// * **FFI Frame Processing**: Low-overhead frame access via `dart:ffi`
+///   (callback on the main isolate; native C/C++ plugins on the camera thread).
 /// * **Unified API**: Easy-to-use reactive state via [ValueNotifier].
 class CameraController extends ValueNotifier<CameraState> {
   int? _textureId;
@@ -147,8 +148,14 @@ class CameraController extends ValueNotifier<CameraState> {
   /// Initializes the camera with the specified [device].
   ///
   /// [format] controls resolution and FPS.
-  /// [enablePhoto] and [enableVideo] prepare the underlying pipeline.
+  /// [pixelFormat] hints the desired frame-processor format (use
+  /// [PixelFormat.rgb] if your processor expects RGB/BGRA).
+  /// [enablePhoto] and [enableVideo] prepare the underlying pipeline — they are
+  /// required before [takePhoto] / [startRecording] respectively.
   /// [codeScanner] enables the high-speed barcode scanning features.
+  /// [mirror] mirrors the **front** camera (the selfie look) for both the
+  /// preview and the captured photo/video; defaults to `true`. Ignored for back
+  /// cameras. See [mirror].
   Future<void> initialize(
     CameraDevice device, {
     CameraDeviceFormat? format,
@@ -254,7 +261,11 @@ class CameraController extends ValueNotifier<CameraState> {
     }
   }
 
-  /// Changes the manual exposure compensation.
+  /// Changes the exposure compensation, in the device's exposure units
+  /// (an EV-bias index on Android; an exposure-target bias on iOS). Clamp to
+  /// [CameraDevice.minExposure]..[CameraDevice.maxExposure].
+  ///
+  /// No-op unless the camera is active (call [setActive] first).
   Future<void> setExposure(double exposure) async {
     if (!_isActive) return;
     try {
@@ -316,8 +327,12 @@ class CameraController extends ValueNotifier<CameraState> {
 
   /// Sets the frame processor for this camera session.
   ///
-  /// The [callback] will be executed on a background isolate for every frame.
-  /// Set to `null` to disable frame processing.
+  /// The [callback] is invoked for every frame, delivered **asynchronously on
+  /// the main isolate's event loop** (via `dart:ffi` `NativeCallable.listener`).
+  /// It does **not** run on a background isolate and does **not** block the
+  /// camera thread — keep the work light, or copy data out and hand it to your
+  /// own isolate. For the heaviest work, register a native C/C++ plugin, which
+  /// runs synchronously on the camera thread. Pass `null` to disable.
   Future<void> setFrameProcessor(FrameProcessorCallback? callback) async {
     _frameProcessorPipeline?.stop();
     _frameProcessorPipeline = null;
@@ -351,6 +366,9 @@ class CameraController extends ValueNotifier<CameraState> {
   /// Takes a snapshot of the current preview.
   ///
   /// Snapshots are usually faster than high-resolution photos.
+  ///
+  /// **iOS only** — not implemented on Android; use [takePhoto] there. On
+  /// Android this throws a [PlatformException] with code `NOT_IMPLEMENTED`.
   Future<PhotoFile> takeSnapshot([TakeSnapshotOptions? options]) async {
     final result = await _channel.invokeMapMethod<String, dynamic>(
       'takeSnapshot',

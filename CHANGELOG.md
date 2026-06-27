@@ -29,6 +29,15 @@ Correctness, honesty, and packaging pass.
 * **Mirroring:** a single `mirror` flag on `initialize` drives both the front-camera preview and the saved
   photo/video; the preview no longer double-mirrors on Android. `CameraPreview` gains `ResizeMode.contain`.
 * **Android:** dynamic capture orientation, correct tap-to-focus metering, real photo orientation.
+* **API:** exposed per-plane strides (`Frame.planeBytesPerRow`/`planePixelStride`) so chroma planes can be
+  walked correctly; added `CameraDevices.getCameraFormat(...)` to pick a format by resolution/fps.
+* **Docs:** comprehensive README (compile-correct quickstart with permissions, photo/video/scan/lifecycle
+  snippets, a correct native C/C++ plugin guide, requirements, expanded platform matrix, Limitations & Roadmap);
+  rewrote the example README; corrected the "background isolate" claim in the API docs to match reality
+  (main isolate); documented `takeSnapshot` (iOS-only), `setExposure` units, and `initialize`'s
+  `pixelFormat`/`mirror`.
+* **Example:** the Native Vision Camera page now reads the raw frame buffer over FFI and shows a live average
+  brightness, demonstrating the headline feature; fixed the C++ sample's row-stride indexing.
 
 ## 0.0.3
 
