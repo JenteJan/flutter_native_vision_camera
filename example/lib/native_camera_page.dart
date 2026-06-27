@@ -25,8 +25,10 @@ class _NativeCameraPageState extends State<NativeCameraPage>
   String? _lastMediaPath;
   bool _isVideo = false;
 
-  // FPS Meter
+  // FPS Meter + a live average-brightness readout computed from the raw frame
+  // buffer over FFI (demonstrates the package's headline feature).
   double _fps = 0;
+  double _brightness = 0;
   int _frameCount = 0;
   DateTime? _lastFpsUpdate;
 
@@ -121,19 +123,24 @@ class _NativeCameraPageState extends State<NativeCameraPage>
         mirror: true,
       );
 
-      // Start FPS counter via frame processor
+      // Frame processor: FPS counter + average-brightness read from the raw
+      // pixel buffer. This is the FFI hot path — read pixels here for ML/CV.
       await _controller.setFrameProcessor((frame) {
         _frameCount++;
         final now = DateTime.now();
         _lastFpsUpdate ??= now;
 
         if (now.difference(_lastFpsUpdate!).inMilliseconds >= 1000) {
+          // computeLuminance reads the Y plane directly over FFI (YUV/Android;
+          // on iOS BGRA it returns 0.0 — read frame.getPlaneData(0) instead).
+          final luma = frame.computeLuminance(0, 0, frame.width, frame.height);
           if (mounted) {
             setState(() {
               _fps =
                   _frameCount *
                   1000 /
                   now.difference(_lastFpsUpdate!).inMilliseconds;
+              _brightness = luma;
               _frameCount = 0;
               _lastFpsUpdate = now;
             });
@@ -285,14 +292,30 @@ class _NativeCameraPageState extends State<NativeCameraPage>
           color: Colors.black54,
           borderRadius: BorderRadius.circular(4),
         ),
-        child: Text(
-          "FPS: ${_fps.toStringAsFixed(1)}",
-          style: const TextStyle(
-            color: Colors.greenAccent,
-            fontWeight: FontWeight.bold,
-            fontSize: 12,
-            fontFamily: "monospace",
-          ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              "FPS: ${_fps.toStringAsFixed(1)}",
+              style: const TextStyle(
+                color: Colors.greenAccent,
+                fontWeight: FontWeight.bold,
+                fontSize: 12,
+                fontFamily: "monospace",
+              ),
+            ),
+            // Proof of the FFI frame read (avg luminance from the Y plane).
+            Text(
+              "LUMA: ${_brightness.toStringAsFixed(0)}",
+              style: const TextStyle(
+                color: Colors.amberAccent,
+                fontWeight: FontWeight.bold,
+                fontSize: 12,
+                fontFamily: "monospace",
+              ),
+            ),
+          ],
         ),
       ),
     );
