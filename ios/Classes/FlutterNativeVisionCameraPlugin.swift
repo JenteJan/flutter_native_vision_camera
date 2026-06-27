@@ -462,11 +462,17 @@ public class SwiftFlutterNativeVisionCameraPlugin: NSObject, FlutterPlugin {
                 return
             }
             let path = self.videoPath ?? recorder.url.path
-            let width = recorder.width
-            let height = recorder.height
+            // The recording transform rotates 90°, so the played file is
+            // portrait — report the oriented (display) dimensions.
+            let width = recorder.height
+            let height = recorder.width
             recorder.finish { [weak self] duration in
-                self?.recorder = nil
-                self?.turnTorchOff()
+                // Mutate plugin state on the session queue (where the frame-append
+                // path reads `recorder`), not on the asset-writer's queue.
+                self?.sessionQueue.async {
+                    self?.recorder = nil
+                    self?.turnTorchOff()
+                }
                 DispatchQueue.main.async {
                     result([
                         "path": path,
@@ -879,6 +885,13 @@ public class SwiftFlutterNativeVisionCameraPlugin: NSObject, FlutterPlugin {
         }
         pixelBufferRenderer = nil
         textureId = nil
+        // Fail any in-flight photo capture so the Dart future resolves instead
+        // of hanging forever on dispose / device-switch.
+        if let pending = pendingPhotoResult {
+            DispatchQueue.main.async {
+                pending(FlutterError(code: "CANCELLED", message: "Camera disposed during photo capture", details: nil))
+            }
+        }
         pendingPhotoResult = nil
     }
 
@@ -1008,9 +1021,11 @@ final class VideoRecorder {
         guard !finished, CMSampleBufferDataIsReady(sampleBuffer) else { return }
         let ts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         if !started {
+            // If startWriting fails, leave `started` false so a later frame can
+            // retry rather than appending into a non-writing writer.
+            guard assetWriter.startWriting() else { return }
             started = true
             startTimestamp = ts
-            assetWriter.startWriting()
             assetWriter.startSession(atSourceTime: ts)
         }
         lastTimestamp = ts
