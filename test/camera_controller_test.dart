@@ -121,6 +121,95 @@ void main() {
       expect(controller.isActive, true);
     });
 
+    CameraDevice makeDevice({
+      Orientation sensorOrientation = Orientation.portrait,
+      CameraPosition position = CameraPosition.back,
+    }) {
+      return CameraDevice(
+        id: 'cam',
+        name: 'Camera',
+        position: position,
+        hasFlash: true,
+        hasTorch: true,
+        minFocusDistance: 0.0,
+        isMultiCam: false,
+        minZoom: 1.0,
+        maxZoom: 10.0,
+        neutralZoom: 1.0,
+        minExposure: -2.0,
+        maxExposure: 2.0,
+        supportsLowLightBoost: false,
+        supportsRawCapture: false,
+        supportsFocus: true,
+        hardwareLevel: HardwareLevel.full,
+        sensorOrientation: sensorOrientation,
+        physicalDevices: const [PhysicalCameraDeviceType.wideAngleCamera],
+        formats: const [],
+      );
+    }
+
+    // Simulates a native -> Dart method call (e.g. onPreviewConfigurationChanged).
+    Future<void> sendNative(String method, dynamic arguments) {
+      return TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .handlePlatformMessage(
+            channel.name,
+            const StandardMethodCodec().encodeMethodCall(
+              MethodCall(method, arguments),
+            ),
+            (_) {},
+          );
+    }
+
+    test(
+      'previewRotation falls back to sensorOrientation before native reports',
+      () async {
+        await controller.initialize(
+          makeDevice(sensorOrientation: Orientation.landscapeLeft),
+        );
+        expect(controller.previewRotation, 1); // 90 / 90
+        // Landscape preview (1280x720) is swapped to portrait in display space.
+        expect(controller.displayPreviewSize, const Size(720, 1280));
+      },
+    );
+
+    test(
+      'previewRotation uses the native rotationDegrees once reported',
+      () async {
+        await controller.initialize(
+          makeDevice(sensorOrientation: Orientation.landscapeLeft),
+        );
+        await sendNative('onPreviewConfigurationChanged', {
+          'rotationDegrees': 0,
+          'mirrored': false,
+        });
+        expect(controller.previewRotation, 0);
+        expect(
+          controller.displayPreviewSize,
+          const Size(1280, 720),
+        ); // not swapped
+      },
+    );
+
+    test('previewMirrored reflects the native report', () async {
+      await controller.initialize(makeDevice(position: CameraPosition.front));
+      expect(controller.previewMirrored, false);
+      await sendNative('onPreviewConfigurationChanged', {
+        'rotationDegrees': 90,
+        'mirrored': true,
+      });
+      expect(controller.previewMirrored, true);
+    });
+
+    test('mirror reflects the init argument (defaults to true)', () async {
+      await controller.initialize(makeDevice());
+      expect(controller.mirror, true);
+
+      final c2 = CameraController();
+      await c2.initialize(makeDevice(), mirror: false);
+      expect(c2.mirror, false);
+      c2.dispose();
+    });
+
     test('dispose clean up correctly', () {
       controller.dispose();
       expect(controller.value, CameraState.disposed);

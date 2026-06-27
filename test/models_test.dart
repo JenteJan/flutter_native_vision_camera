@@ -33,5 +33,26 @@ void main() {
         Orientation.portraitUpsideDown,
       );
     });
+
+    test('Orientation.degrees (drives preview rotation)', () {
+      expect(Orientation.portrait.degrees, 0);
+      expect(Orientation.landscapeLeft.degrees, 90);
+      expect(Orientation.portraitUpsideDown.degrees, 180);
+      expect(Orientation.landscapeRight.degrees, 270);
+    });
+  });
+
+  group('FrameProcessorThrottler', () {
+    test('admits at most targetFps frames per second', () {
+      final throttler = FrameProcessorThrottler(
+        targetFps: 10,
+      ); // 100ms interval
+      // Real camera timestamps are large, so the first frame is admitted.
+      expect(throttler.shouldProcess(1000), true);
+      expect(throttler.shouldProcess(1050), false);
+      expect(throttler.shouldProcess(1100), true);
+      expect(throttler.shouldProcess(1150), false);
+      expect(throttler.shouldProcess(1200), true);
+    });
   });
 }
