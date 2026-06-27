@@ -190,6 +190,34 @@ void main() {
       },
     );
 
+    test('previewRectFromFrame maps boxes into preview space', () async {
+      await controller.initialize(
+        makeDevice(sensorOrientation: Orientation.landscapeLeft),
+        mirror: false,
+      );
+      await sendNative('onPreviewConfigurationChanged', {
+        'rotationDegrees': 90, // preview is one quarter-turn
+        'mirrored': false,
+      });
+      const box = Rect.fromLTRB(0.1, 0.2, 0.4, 0.6);
+
+      // Frame rotated to match the preview (90°) → identity (the portrait case).
+      expect(
+        controller.previewRectFromFrame(box, sourceRotationDegrees: 90),
+        box,
+      );
+
+      // 90° difference → one quarter-turn clockwise: (x,y) -> (1-y, x).
+      final rotated = controller.previewRectFromFrame(
+        box,
+        sourceRotationDegrees: 0,
+      );
+      expect(rotated.left, closeTo(0.4, 1e-9));
+      expect(rotated.top, closeTo(0.1, 1e-9));
+      expect(rotated.right, closeTo(0.8, 1e-9));
+      expect(rotated.bottom, closeTo(0.4, 1e-9));
+    });
+
     test('previewMirrored reflects the native report', () async {
       await controller.initialize(makeDevice(position: CameraPosition.front));
       expect(controller.previewMirrored, false);

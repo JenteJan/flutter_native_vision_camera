@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.0.6
+
+* **New:** `CameraController.previewRectFromFrame(rect, sourceRotationDegrees:)` maps a normalized
+  detection box from a frame's coordinate space into preview-display space, accounting for the live preview
+  rotation and the front-camera mirror — so ML overlays line up with the preview **at any device
+  orientation** (the preview rotation and frame orientation are tracked independently, so boxes drawn
+  without it drift as the phone turns).
+* **Example:** added a real-time **Object Detector** page — the FFI frame pipeline drives an on-device
+  EfficientDet-Lite0 detector (90 COCO classes) in a background isolate, with labelled boxes and a
+  cat-certainty voting trigger. Demonstrates YUV→RGB preprocessing, isolate inference, and
+  `previewRectFromFrame` for correctly-oriented overlays.
+
 ## 0.0.5
 
 * **Docs:** added demo GIFs to the README (live preview + orientation, barcode/QR scanning with overlay,

@@ -3,6 +3,7 @@ import 'package:flutter_native_vision_camera/flutter_native_vision_camera.dart';
 import 'native_camera_page.dart';
 import 'standard_camera_page.dart';
 import 'code_scanner_page.dart';
+import 'object_detector_page.dart';
 
 import 'package:flutter/services.dart';
 
@@ -79,6 +80,19 @@ class _HomePageState extends State<HomePage> {
               onTap: () {
                 Navigator.of(context).push(
                   MaterialPageRoute(builder: (_) => const CodeScannerPage()),
+                );
+              },
+            ),
+            const SizedBox(height: 16),
+            _buildFeatureCard(
+              context,
+              title: 'Object Detector',
+              subtitle: 'Frame processor → EfficientDet (90 classes) + boxes',
+              icon: Icons.center_focus_strong,
+              color: Colors.deepPurple,
+              onTap: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const ObjectDetectorPage()),
                 );
               },
             ),

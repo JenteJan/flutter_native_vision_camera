@@ -46,6 +46,9 @@ dependencies:
   camera: ^0.11.2+1
   permission_handler: ^12.0.1
   video_player: ^2.9.2
+  # On-device object detection (EfficientDet-Lite0, COCO "cat" class) for the
+  # cat-detector demo. Example-only dependency — the plugin itself doesn't use it.
+  tflite_flutter: ^0.11.0
 
 dev_dependencies:
   flutter_test:
@@ -68,6 +71,10 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+  assets:
+    - assets/efficientdet.tflite
+    - assets/coco_labels.txt
 
   # To add assets to your application, add an assets section, like this:
   # assets:
