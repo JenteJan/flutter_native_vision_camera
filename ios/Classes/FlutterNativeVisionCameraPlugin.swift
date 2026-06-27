@@ -359,36 +359,47 @@ public class SwiftFlutterNativeVisionCameraPlugin: NSObject, FlutterPlugin {
     // MARK: - Photo Capture
 
     private func takePhoto(options: [String: Any], result: @escaping FlutterResult) {
-        guard let photoOutput = photoOutput else {
-            result(FlutterError(code: "NOT_INITIALIZED", message: "Photo output not initialized", details: nil))
-            return
-        }
-
-        let settings = AVCapturePhotoSettings()
-
-        if let flash = options["flash"] as? String {
-            switch flash {
-            case "on": settings.flashMode = .on
-            case "auto": settings.flashMode = .auto
-            default: settings.flashMode = .off
+        // pendingPhotoResult is owned by the session queue; all access (set here,
+        // read in the delegate, clear in teardown) happens on it.
+        sessionQueue.async { [weak self] in
+            guard let self = self else { return }
+            guard let photoOutput = self.photoOutput else {
+                DispatchQueue.main.async {
+                    result(FlutterError(code: "NOT_INITIALIZED", message: "Photo output not initialized", details: nil))
+                }
+                return
             }
-        }
-
-        if let enableHdr = options["enableHdr"] as? Swift.Bool, enableHdr {
-            if #available(iOS 13.0, *) {
-                settings.photoQualityPrioritization = .quality
+            if self.pendingPhotoResult != nil {
+                DispatchQueue.main.async {
+                    result(FlutterError(code: "CAPTURE_IN_PROGRESS", message: "A photo capture is already in progress", details: nil))
+                }
+                return
             }
-        }
 
-        // Mirror the saved photo only when explicitly requested (selfie mirror);
-        // otherwise capture what the camera actually sees.
-        if let conn = photoOutput.connection(with: .video), conn.isVideoMirroringSupported {
-            conn.automaticallyAdjustsVideoMirroring = false
-            conn.isVideoMirrored = self.mirrorCaptures && (self.captureDevice?.position == .front)
-        }
+            let settings = AVCapturePhotoSettings()
+            if let flash = options["flash"] as? String {
+                switch flash {
+                case "on": settings.flashMode = .on
+                case "auto": settings.flashMode = .auto
+                default: settings.flashMode = .off
+                }
+            }
+            if let enableHdr = options["enableHdr"] as? Swift.Bool, enableHdr {
+                if #available(iOS 13.0, *) {
+                    settings.photoQualityPrioritization = .quality
+                }
+            }
 
-        self.pendingPhotoResult = result
-        photoOutput.capturePhoto(with: settings, delegate: self)
+            // Mirror the saved photo only when explicitly requested (selfie
+            // mirror); otherwise capture what the camera actually sees.
+            if let conn = photoOutput.connection(with: .video), conn.isVideoMirroringSupported {
+                conn.automaticallyAdjustsVideoMirroring = false
+                conn.isVideoMirrored = self.mirrorCaptures && (self.captureDevice?.position == .front)
+            }
+
+            self.pendingPhotoResult = result
+            photoOutput.capturePhoto(with: settings, delegate: self)
+        }
     }
 
     // MARK: - Video Recording
@@ -920,44 +931,47 @@ extension SwiftFlutterNativeVisionCameraPlugin: AVCaptureAudioDataOutputSampleBu
 
 extension SwiftFlutterNativeVisionCameraPlugin: AVCapturePhotoCaptureDelegate {
     public func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
-        guard let result = self.pendingPhotoResult else { return }
-        self.pendingPhotoResult = nil
+        // Read/clear pendingPhotoResult on its owning queue (the session queue).
+        sessionQueue.async { [weak self] in
+            guard let self = self, let result = self.pendingPhotoResult else { return }
+            self.pendingPhotoResult = nil
 
-        if let error = error {
-            DispatchQueue.main.async {
-                result(FlutterError(code: "CAPTURE_ERROR", message: error.localizedDescription, details: nil))
+            if let error = error {
+                DispatchQueue.main.async {
+                    result(FlutterError(code: "CAPTURE_ERROR", message: error.localizedDescription, details: nil))
+                }
+                return
             }
-            return
-        }
 
-        guard let data = photo.fileDataRepresentation() else {
-            DispatchQueue.main.async {
-                result(FlutterError(code: "CAPTURE_ERROR", message: "Failed to get photo data", details: nil))
+            guard let data = photo.fileDataRepresentation() else {
+                DispatchQueue.main.async {
+                    result(FlutterError(code: "CAPTURE_ERROR", message: "Failed to get photo data", details: nil))
+                }
+                return
             }
-            return
-        }
 
-        let tempDir = FileManager.default.temporaryDirectory
-        let fileName = "photo_\(Int(Date().timeIntervalSince1970)).jpg"
-        let fileURL = tempDir.appendingPathComponent(fileName)
-        let isMirrored = self.mirrorCaptures && (self.captureDevice?.position == .front)
+            let tempDir = FileManager.default.temporaryDirectory
+            let fileName = "photo_\(Int(Date().timeIntervalSince1970)).jpg"
+            let fileURL = tempDir.appendingPathComponent(fileName)
+            let isMirrored = self.mirrorCaptures && (self.captureDevice?.position == .front)
 
-        do {
-            try data.write(to: fileURL)
-            let dims = photo.resolvedSettings.photoDimensions
-            DispatchQueue.main.async {
-                result([
-                    "path": fileURL.path,
-                    "width": Int(dims.width),
-                    "height": Int(dims.height),
-                    "isRawPhoto": false,
-                    "orientation": "portrait",
-                    "isMirrored": isMirrored
-                ])
-            }
-        } catch {
-            DispatchQueue.main.async {
-                result(FlutterError(code: "CAPTURE_ERROR", message: "Failed to save photo: \(error.localizedDescription)", details: nil))
+            do {
+                try data.write(to: fileURL)
+                let dims = photo.resolvedSettings.photoDimensions
+                DispatchQueue.main.async {
+                    result([
+                        "path": fileURL.path,
+                        "width": Int(dims.width),
+                        "height": Int(dims.height),
+                        "isRawPhoto": false,
+                        "orientation": "portrait",
+                        "isMirrored": isMirrored
+                    ])
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    result(FlutterError(code: "CAPTURE_ERROR", message: "Failed to save photo: \(error.localizedDescription)", details: nil))
+                }
             }
         }
     }

@@ -596,6 +596,10 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
                 .build()
             videoCapture = VideoCapture.Builder(recorder)
                 .setTargetRotation(rotation)
+                .setMirrorMode(
+                    if (mirrorCaptures) MirrorMode.MIRROR_MODE_ON_FRONT_ONLY
+                    else MirrorMode.MIRROR_MODE_OFF
+                )
                 .build()
         }
 
