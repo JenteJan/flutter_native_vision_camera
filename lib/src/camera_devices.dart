@@ -56,4 +56,44 @@ class CameraDevices {
     final multiCam = matching.where((d) => d.isMultiCam);
     return multiCam.isNotEmpty ? multiCam.first : matching.first;
   }
+
+  /// Picks the [CameraDeviceFormat] from [device] that best matches the desired
+  /// video resolution ([targetWidth] x [targetHeight]) and supports [targetFps].
+  ///
+  /// Pass it to `CameraController.initialize(device, format: ...)`. With no
+  /// targets it returns the highest-resolution format. Returns `null` if the
+  /// device exposes no formats.
+  static CameraDeviceFormat? getCameraFormat(
+    CameraDevice device, {
+    int? targetWidth,
+    int? targetHeight,
+    int? targetFps,
+  }) {
+    if (device.formats.isEmpty) return null;
+
+    var candidates = device.formats;
+    if (targetFps != null) {
+      final supported = candidates
+          .where((f) => f.minFps <= targetFps && targetFps <= f.maxFps)
+          .toList();
+      if (supported.isNotEmpty) candidates = supported;
+    }
+
+    if (targetWidth != null && targetHeight != null) {
+      final targetArea = targetWidth * targetHeight;
+      return ([...candidates]..sort((a, b) {
+            final da = (a.videoWidth * a.videoHeight - targetArea).abs();
+            final db = (b.videoWidth * b.videoHeight - targetArea).abs();
+            return da.compareTo(db);
+          }))
+          .first;
+    }
+
+    return ([...candidates]..sort(
+          (a, b) => (b.videoWidth * b.videoHeight).compareTo(
+            a.videoWidth * a.videoHeight,
+          ),
+        ))
+        .first;
+  }
 }

@@ -19,13 +19,16 @@ class _NativeCameraPageState extends State<NativeCameraPage>
   CameraDevice? _currentDevice;
   CameraDeviceFormat? _currentFormat;
   bool _isInitialized = false;
+  String? _error;
 
   double _zoom = 1.0;
   String? _lastMediaPath;
   bool _isVideo = false;
 
-  // FPS Meter
+  // FPS Meter + a live average-brightness readout computed from the raw frame
+  // buffer over FFI (demonstrates the package's headline feature).
   double _fps = 0;
+  double _brightness = 0;
   int _frameCount = 0;
   DateTime? _lastFpsUpdate;
 
@@ -56,18 +59,37 @@ class _NativeCameraPageState extends State<NativeCameraPage>
   }
 
   Future<void> _initialize() async {
-    final camStatus = await CameraPermissions.requestCameraPermission();
-    if (camStatus != PermissionStatus.granted) return;
+    try {
+      final camStatus = await CameraPermissions.requestCameraPermission();
+      if (camStatus != PermissionStatus.granted) {
+        if (mounted) {
+          setState(() => _error = "Camera permission denied.");
+        }
+        return;
+      }
 
-    final devices = await CameraDevices.getAvailableCameraDevices();
-    if (devices.isEmpty) return;
+      final devices = await CameraDevices.getAvailableCameraDevices();
+      if (devices.isEmpty) {
+        if (mounted) {
+          setState(
+            () => _error =
+                "No camera devices found. (If on simulator, check settings)",
+          );
+        }
+        return;
+      }
 
-    _devices = devices;
-    _currentDevice =
-        CameraDevices.getCameraDevice(devices, CameraPosition.back) ??
-        devices.first;
+      _devices = devices;
+      _currentDevice =
+          CameraDevices.getCameraDevice(devices, CameraPosition.back) ??
+          devices.first;
 
-    await _startCamera();
+      await _startCamera();
+    } catch (e) {
+      if (mounted) {
+        setState(() => _error = "Initialization failed: $e");
+      }
+    }
   }
 
   Future<void> _startCamera() async {
@@ -96,21 +118,29 @@ class _NativeCameraPageState extends State<NativeCameraPage>
         format: _currentFormat,
         enablePhoto: true,
         enableVideo: true,
+        // One flag drives BOTH the preview and the saved image: true = selfie
+        // mirror, false = save what the camera actually sees.
+        mirror: true,
       );
 
-      // Start FPS counter via frame processor
+      // Frame processor: FPS counter + average-brightness read from the raw
+      // pixel buffer. This is the FFI hot path — read pixels here for ML/CV.
       await _controller.setFrameProcessor((frame) {
         _frameCount++;
         final now = DateTime.now();
         _lastFpsUpdate ??= now;
 
         if (now.difference(_lastFpsUpdate!).inMilliseconds >= 1000) {
+          // computeLuminance reads the Y plane directly over FFI (YUV/Android;
+          // on iOS BGRA it returns 0.0 — read frame.getPlaneData(0) instead).
+          final luma = frame.computeLuminance(0, 0, frame.width, frame.height);
           if (mounted) {
             setState(() {
               _fps =
                   _frameCount *
                   1000 /
                   now.difference(_lastFpsUpdate!).inMilliseconds;
+              _brightness = luma;
               _frameCount = 0;
               _lastFpsUpdate = now;
             });
@@ -185,6 +215,40 @@ class _NativeCameraPageState extends State<NativeCameraPage>
 
   @override
   Widget build(BuildContext context) {
+    if (_error != null) {
+      return Scaffold(
+        backgroundColor: Colors.black,
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24.0),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(
+                  Icons.error_outline,
+                  color: Colors.redAccent,
+                  size: 64,
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  _error!,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white, fontSize: 16),
+                ),
+                const SizedBox(height: 32),
+                ElevatedButton(
+                  onPressed: () {
+                    setState(() => _error = null);
+                    _initialize();
+                  },
+                  child: const Text("Retry"),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
     return ValueListenableBuilder<CameraState>(
       valueListenable: _controller,
       builder: (context, state, _) {
@@ -193,18 +257,15 @@ class _NativeCameraPageState extends State<NativeCameraPage>
           body: Stack(
             children: [
               if (_isInitialized)
+                // CameraPreview self-orients via controller.previewRotation —
+                // no AspectRatio/RotatedBox compensation needed here.
                 Positioned.fill(
-                  child: Center(
-                    child: AspectRatio(
-                      aspectRatio:
-                          (_currentFormat?.videoHeight ?? 1) /
-                          (_currentFormat?.videoWidth ?? 1),
-                      child: CameraPreview(
-                        controller: _controller,
-                        resizeMode: ResizeMode.cover,
-                        onTapToFocus: true,
-                      ),
-                    ),
+                  child: CameraPreview(
+                    controller: _controller,
+                    // Fit the whole frame inside the view (letterboxed) so the
+                    // full image is visible instead of cropped to fill.
+                    resizeMode: ResizeMode.contain,
+                    onTapToFocus: true,
                   ),
                 )
               else
@@ -231,14 +292,30 @@ class _NativeCameraPageState extends State<NativeCameraPage>
           color: Colors.black54,
           borderRadius: BorderRadius.circular(4),
         ),
-        child: Text(
-          "FPS: ${_fps.toStringAsFixed(1)}",
-          style: const TextStyle(
-            color: Colors.greenAccent,
-            fontWeight: FontWeight.bold,
-            fontSize: 12,
-            fontFamily: "monospace",
-          ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              "FPS: ${_fps.toStringAsFixed(1)}",
+              style: const TextStyle(
+                color: Colors.greenAccent,
+                fontWeight: FontWeight.bold,
+                fontSize: 12,
+                fontFamily: "monospace",
+              ),
+            ),
+            // Proof of the FFI frame read (avg luminance from the Y plane).
+            Text(
+              "LUMA: ${_brightness.toStringAsFixed(0)}",
+              style: const TextStyle(
+                color: Colors.amberAccent,
+                fontWeight: FontWeight.bold,
+                fontSize: 12,
+                fontFamily: "monospace",
+              ),
+            ),
+          ],
         ),
       ),
     );

@@ -1,0 +1,10 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Remove duplicate header",
+			"type": "shell",
+			"command": "rm /Volumes/External/FlutterProjects/flutter_native_vision_camera/ios/Classes/FlutterNativeVisionCameraPlugin.h"
+		}
+	]
+}

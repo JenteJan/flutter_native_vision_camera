@@ -4,14 +4,20 @@
 static JavaVM* g_javaVM = NULL;
 static jclass g_pluginClass = NULL;
 static jmethodID g_releaseFrameMethod = NULL;
+static jmethodID g_retainFrameMethod = NULL;
 
 #define FRAME_MAGIC 0xFEEDFACE
 
+// Android frame handle: holds direct pointers + strides for every plane so the
+// Dart/C++ side can read true multi-plane YUV (not just the Y plane).
 typedef struct {
     uint32_t magic;
-    uint32_t padding;
+    uint32_t numPlanes;
     uint64_t id;
-    void* address;
+    void* planes[3];
+    int32_t rowStrides[3];
+    int32_t pixelStrides[3];
+    int32_t planeSizes[3];
 } NativeFrame;
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
@@ -22,17 +28,39 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     }
     jclass localClass = (*env)->FindClass(env, "dev/jentejan/flutter_native_vision_camera/FlutterNativeVisionCameraPlugin");
     if (!localClass) return JNI_ERR;
-    
+
     g_pluginClass = (*env)->NewGlobalRef(env, localClass);
-    // Updated signature: returns Int (I)
     g_releaseFrameMethod = (*env)->GetStaticMethodID(env, g_pluginClass, "releaseFrame", "(J)I");
-    
-    if (!g_releaseFrameMethod) {
-        __android_log_print(ANDROID_LOG_ERROR, "VisionCamera", "Failed to find releaseFrame(J)I");
+    g_retainFrameMethod = (*env)->GetStaticMethodID(env, g_pluginClass, "retainFrame", "(J)I");
+
+    if (!g_releaseFrameMethod || !g_retainFrameMethod) {
+        __android_log_print(ANDROID_LOG_ERROR, "VisionCamera", "Failed to find releaseFrame/retainFrame methods");
         return JNI_ERR;
     }
-    
+
     return JNI_VERSION_1_6;
+}
+
+// Invokes a static int(long) method on the plugin class, attaching the current
+// thread to the JVM if necessary.
+static int call_frame_jni(jmethodID method, uint64_t id) {
+    if (g_javaVM == NULL || method == NULL) {
+        __android_log_print(ANDROID_LOG_ERROR, "VisionCamera", "JNI not initialized for frame %lld", (long long)id);
+        return 0;
+    }
+    JNIEnv* env;
+    int status = (*g_javaVM)->GetEnv(g_javaVM, (void**)&env, JNI_VERSION_1_6);
+    int attached = 0;
+    if (status == JNI_EDETACHED) {
+        status = (*g_javaVM)->AttachCurrentThread(g_javaVM, (void**)&env, NULL);
+        attached = 1;
+    }
+    int result = 0;
+    if (status == JNI_OK && env != NULL) {
+        result = (*env)->CallStaticIntMethod(env, g_pluginClass, method, (jlong)id);
+        if (attached) (*g_javaVM)->DetachCurrentThread(g_javaVM);
+    }
+    return result;
 }
 #else
 #include <CoreVideo/CoreVideo.h>
@@ -41,6 +69,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include "flutter_native_vision_camera.h"
 
 // ─── Plugin System ───────────────────────────────────────────────────
@@ -71,154 +100,200 @@ FFI_PLUGIN_EXPORT void VisionCamera_unregisterPlugin(const char* name) {
 // ─── Frame Accessors ─────────────────────────────────────────────────
 
 FFI_PLUGIN_EXPORT int32_t Frame_getBytesPerRow(FrameHandle handle) {
-#ifdef ANDROID
-    // In YUV_420_888, planes might have different strides. 
-    // This is a simplified return for the Y plane.
-    return 0; // Better to get this from metadata or a separate helper
-#else
     if (handle == NULL) return 0;
+#ifdef ANDROID
+    NativeFrame* frame = (NativeFrame*)handle;
+    if (frame->magic != FRAME_MAGIC) return 0;
+    return frame->rowStrides[0];
+#else
     return (int32_t)CVPixelBufferGetBytesPerRow((CVPixelBufferRef)handle);
 #endif
 }
 
-FFI_PLUGIN_EXPORT int32_t Frame_getPlanesCount(FrameHandle handle) {
-#ifdef ANDROID
-    return 3; // Y, U, V
-#else
+FFI_PLUGIN_EXPORT int32_t Frame_getPlaneBytesPerRow(FrameHandle handle, int32_t planeIndex) {
     if (handle == NULL) return 0;
-    return (int32_t)CVPixelBufferGetPlaneCount((CVPixelBufferRef)handle);
+#ifdef ANDROID
+    NativeFrame* frame = (NativeFrame*)handle;
+    if (frame->magic != FRAME_MAGIC) return 0;
+    if (planeIndex < 0 || planeIndex >= (int32_t)frame->numPlanes) return 0;
+    return frame->rowStrides[planeIndex];
+#else
+    CVPixelBufferRef pixelBuffer = (CVPixelBufferRef)handle;
+    if (CVPixelBufferIsPlanar(pixelBuffer)) {
+        return (int32_t)CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, planeIndex);
+    }
+    return (int32_t)CVPixelBufferGetBytesPerRow(pixelBuffer);
+#endif
+}
+
+FFI_PLUGIN_EXPORT int32_t Frame_getPlanePixelStride(FrameHandle handle, int32_t planeIndex) {
+    if (handle == NULL) return 0;
+#ifdef ANDROID
+    NativeFrame* frame = (NativeFrame*)handle;
+    if (frame->magic != FRAME_MAGIC) return 0;
+    if (planeIndex < 0 || planeIndex >= (int32_t)frame->numPlanes) return 0;
+    return frame->pixelStrides[planeIndex];
+#else
+    // BGRA is interleaved (4 bytes/pixel); planar buffers are tightly packed.
+    CVPixelBufferRef pixelBuffer = (CVPixelBufferRef)handle;
+    return CVPixelBufferIsPlanar(pixelBuffer) ? 1 : 4;
+#endif
+}
+
+FFI_PLUGIN_EXPORT int32_t Frame_getPlanesCount(FrameHandle handle) {
+    if (handle == NULL) return 0;
+#ifdef ANDROID
+    NativeFrame* frame = (NativeFrame*)handle;
+    if (frame->magic != FRAME_MAGIC) return 0;
+    return (int32_t)frame->numPlanes;
+#else
+    CVPixelBufferRef pixelBuffer = (CVPixelBufferRef)handle;
+    if (CVPixelBufferIsPlanar(pixelBuffer)) {
+        return (int32_t)CVPixelBufferGetPlaneCount(pixelBuffer);
+    }
+    return 1;
 #endif
 }
 
 FFI_PLUGIN_EXPORT void* Frame_getPlanePointer(FrameHandle handle, int32_t planeIndex) {
-#ifdef ANDROID
     if (handle == NULL) return NULL;
+#ifdef ANDROID
     NativeFrame* frame = (NativeFrame*)handle;
     if (frame->magic != FRAME_MAGIC) return NULL;
-    return frame->address; 
+    if (planeIndex < 0 || planeIndex >= (int32_t)frame->numPlanes) return NULL;
+    return frame->planes[planeIndex];
 #else
-    if (handle == NULL) return NULL;
+    // The buffer is locked once for the lifetime of the frame in
+    // VisionCamera_dispatchFrame and unlocked in Frame_decrementRefCount.
     CVPixelBufferRef pixelBuffer = (CVPixelBufferRef)handle;
-    CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
     if (CVPixelBufferIsPlanar(pixelBuffer)) {
         return CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, planeIndex);
-    } else {
-        return CVPixelBufferGetBaseAddress(pixelBuffer);
     }
+    return CVPixelBufferGetBaseAddress(pixelBuffer);
 #endif
 }
 
 FFI_PLUGIN_EXPORT int32_t Frame_getPlaneSize(FrameHandle handle, FrameMetadata metadata, int32_t planeIndex) {
     if (handle == NULL) return 0;
 #ifdef ANDROID
-    if (planeIndex == 0) return metadata.width * metadata.height;
-    return (metadata.width / 2) * (metadata.height / 2);
+    NativeFrame* frame = (NativeFrame*)handle;
+    if (frame->magic != FRAME_MAGIC) return 0;
+    if (planeIndex < 0 || planeIndex >= (int32_t)frame->numPlanes) return 0;
+    return frame->planeSizes[planeIndex];
 #else
     CVPixelBufferRef pixelBuffer = (CVPixelBufferRef)handle;
     if (CVPixelBufferIsPlanar(pixelBuffer)) {
         return (int32_t)(CVPixelBufferGetHeightOfPlane(pixelBuffer, planeIndex) * CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, planeIndex));
-    } else {
-        return (int32_t)(metadata.height * CVPixelBufferGetBytesPerRow(pixelBuffer));
     }
+    return (int32_t)(metadata.height * CVPixelBufferGetBytesPerRow(pixelBuffer));
 #endif
 }
 
 FFI_PLUGIN_EXPORT void Frame_incrementRefCount(FrameHandle handle) {
-#ifndef ANDROID
-    if (handle != NULL) {
-        CFRetain((CVPixelBufferRef)handle);
-    }
+    if (handle == NULL) return;
+#ifdef ANDROID
+    NativeFrame* frame = (NativeFrame*)handle;
+    if (frame->magic != FRAME_MAGIC) return;
+    call_frame_jni(g_retainFrameMethod, frame->id);
+#else
+    // Each reference holds one lock; every decrement unlocks exactly once, so a
+    // retain must take a matching lock or the buffer would be over-unlocked.
+    CVPixelBufferLockBaseAddress((CVPixelBufferRef)handle, kCVPixelBufferLock_ReadOnly);
+    CFRetain((CVPixelBufferRef)handle);
 #endif
 }
 
 FFI_PLUGIN_EXPORT void Frame_decrementRefCount(FrameHandle handle) {
-#ifdef ANDROID
     if (handle == NULL) return;
+#ifdef ANDROID
     NativeFrame* frame = (NativeFrame*)handle;
-    
-    // Safety check: only process and free if magic matches
+
+    // Safety check: only process and free if magic matches.
     if (frame->magic != FRAME_MAGIC) {
         __android_log_print(ANDROID_LOG_WARN, "VisionCamera", "Attempted to release invalid handle %p!", handle);
         return;
     }
 
-    if (g_javaVM != NULL && g_releaseFrameMethod != NULL) {
-        JNIEnv* env;
-        int status = (*g_javaVM)->GetEnv(g_javaVM, (void**)&env, JNI_VERSION_1_6);
-        int attached = 0;
-        if (status == JNI_EDETACHED) {
-            status = (*g_javaVM)->AttachCurrentThread(g_javaVM, (void**)&env, NULL);
-            attached = 1;
-        }
-        
-        if (status == JNI_OK && env != NULL) {
-            // Call Kotlin releaseFrame
-            (*env)->CallStaticIntMethod(env, g_pluginClass, g_releaseFrameMethod, (jlong)frame->id);
-            
-            if (attached) (*g_javaVM)->DetachCurrentThread(g_javaVM);
-        } else {
-            __android_log_print(ANDROID_LOG_ERROR, "VisionCamera", "Failed to get JNIEnv to release frame %lld", (long long)frame->id);
-        }
-    } else {
-        __android_log_print(ANDROID_LOG_ERROR, "VisionCamera", "JNI not initialized, leaking frame %lld", (long long)frame->id);
+    int remaining = call_frame_jni(g_releaseFrameMethod, frame->id);
+
+    // Only free the struct once the underlying image is fully released (refcount
+    // reached zero). A Dart-side incrementRefCount()/retain bumps the count, so
+    // the struct (and its plane pointers) must stay valid until the final
+    // decrement — freeing on the first decrement would be a use-after-free.
+    if (remaining <= 0) {
+        // Mark as invalid BEFORE freeing to catch double-frees.
+        frame->magic = 0;
+        free(frame);
     }
-    
-    // Mark as invalid BEFORE freeing to catch double-frees
-    frame->magic = 0;
-    free(frame);
 #else
-    if (handle != NULL) {
-        CVPixelBufferRef pixelBuffer = (CVPixelBufferRef)handle;
-        CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
-        CFRelease(pixelBuffer);
-    }
+    CVPixelBufferRef pixelBuffer = (CVPixelBufferRef)handle;
+    CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+    CFRelease(pixelBuffer);
 #endif
 }
 
-static FrameProcessorCallback g_frameProcessorCallback = NULL;
+static _Atomic(FrameProcessorCallback) g_frameProcessorCallback = NULL;
+static pthread_mutex_t g_cbMutex = PTHREAD_MUTEX_INITIALIZER;
 
 FFI_PLUGIN_EXPORT void VisionCamera_setFrameProcessorCallback(FrameProcessorCallback callback) {
-    g_frameProcessorCallback = callback;
+    // Serialize with dispatch so detaching the callback (and the Dart-side
+    // NativeCallable.close()) can't race a call that is mid-flight.
+    pthread_mutex_lock(&g_cbMutex);
+    atomic_store(&g_frameProcessorCallback, callback);
+    pthread_mutex_unlock(&g_cbMutex);
 }
 
 FFI_PLUGIN_EXPORT void VisionCamera_dispatchFrame(FrameHandle handle, FrameMetadata metadata) {
-    // 1. Notify C/C++ Plugins first (Zero latency, synchronous)
+#ifndef ANDROID
+    // iOS: lock the pixel buffer once for the whole frame lifetime. It is
+    // unlocked exactly once in Frame_decrementRefCount.
+    CVPixelBufferLockBaseAddress((CVPixelBufferRef)handle, kCVPixelBufferLock_ReadOnly);
+#endif
+
+    // 1. Notify C/C++ Plugins first (zero latency, synchronous).
     for (int i = 0; i < g_pluginCount; i++) {
         g_plugins[i].onFrame(handle, metadata);
     }
 
-    // 2. Notify Dart (FFI Isolate dispatch)
-    if (g_frameProcessorCallback != NULL) {
-        // Dart will be responsible for calling Frame_decrementRefCount
-        g_frameProcessorCallback(handle, metadata);
-    } else {
-        // No Dart listener, release the reference taken by the native side
+    // 2. Notify Dart (FFI dispatch). Dart is then responsible for calling
+    //    Frame_decrementRefCount exactly once. Hold the mutex across the
+    //    load+call so teardown can't close the callable mid-dispatch.
+    pthread_mutex_lock(&g_cbMutex);
+    FrameProcessorCallback cb = atomic_load(&g_frameProcessorCallback);
+    if (cb != NULL) {
+        cb(handle, metadata);
+    }
+    pthread_mutex_unlock(&g_cbMutex);
+
+    if (cb == NULL) {
+        // No Dart listener; release the reference taken by the native side.
         Frame_decrementRefCount(handle);
     }
 }
 
 // ─── Image Processing Helpers ────────────────────────────────────────
 
-FFI_PLUGIN_EXPORT double VisionCamera_computeLuminance(const uint8_t* yPlane, int32_t width, int32_t height, int32_t startX, int32_t startY, int32_t endX, int32_t endY) {
+FFI_PLUGIN_EXPORT double VisionCamera_computeLuminance(const uint8_t* yPlane, int32_t width, int32_t height, int32_t rowStride, int32_t startX, int32_t startY, int32_t endX, int32_t endY) {
     if (yPlane == NULL) return 0.0;
-    
+    if (rowStride <= 0) rowStride = width;
+
     if (startX < 0) startX = 0;
     if (startY < 0) startY = 0;
     if (endX >= width) endX = width - 1;
     if (endY >= height) endY = height - 1;
-    
+
     if (startX > endX || startY > endY) return 0.0;
-    
+
     uint64_t sum = 0;
     int32_t count = 0;
-    
+
     for (int y = startY; y <= endY; y++) {
         for (int x = startX; x <= endX; x++) {
-            sum += yPlane[y * width + x];
+            sum += yPlane[y * rowStride + x];
             count++;
         }
     }
-    
+
     if (count == 0) return 0.0;
     return (double)sum / (double)count;
 }
@@ -226,18 +301,28 @@ FFI_PLUGIN_EXPORT double VisionCamera_computeLuminance(const uint8_t* yPlane, in
 #ifdef ANDROID
 JNIEXPORT void JNICALL
 Java_dev_jentejan_flutter_1native_1vision_1camera_FlutterNativeVisionCameraPlugin_nativeDispatchFrame(
-    JNIEnv* env, jobject thiz, jobject buffer, jint width, jint height, jint format, jint orientation, jdouble timestamp, jlong id, jlong address) {
-    
+    JNIEnv* env, jobject thiz,
+    jobject b0, jobject b1, jobject b2,
+    jint rs0, jint rs1, jint rs2,
+    jint ps0, jint ps1, jint ps2,
+    jint sz0, jint sz1, jint sz2,
+    jint numPlanes,
+    jint width, jint height, jint format, jint orientation, jdouble timestamp, jlong id) {
+
     NativeFrame* frame = (NativeFrame*)malloc(sizeof(NativeFrame));
+    if (frame == NULL) return;
+
     frame->magic = FRAME_MAGIC;
     frame->id = (uint64_t)id;
-    
-    // If address wasn't passed or is 0, try to get it from the direct buffer
-    if (address == 0 && buffer != NULL) {
-        frame->address = (*env)->GetDirectBufferAddress(env, buffer);
-    } else {
-        frame->address = (void*)address;
-    }
+    frame->numPlanes = (uint32_t)numPlanes;
+
+    frame->planes[0] = (b0 != NULL) ? (*env)->GetDirectBufferAddress(env, b0) : NULL;
+    frame->planes[1] = (b1 != NULL) ? (*env)->GetDirectBufferAddress(env, b1) : NULL;
+    frame->planes[2] = (b2 != NULL) ? (*env)->GetDirectBufferAddress(env, b2) : NULL;
+
+    frame->rowStrides[0] = rs0; frame->rowStrides[1] = rs1; frame->rowStrides[2] = rs2;
+    frame->pixelStrides[0] = ps0; frame->pixelStrides[1] = ps1; frame->pixelStrides[2] = ps2;
+    frame->planeSizes[0] = sz0; frame->planeSizes[1] = sz1; frame->planeSizes[2] = sz2;
 
     FrameMetadata metadata = {
         .width = width,
@@ -248,12 +333,6 @@ Java_dev_jentejan_flutter_1native_1vision_1camera_FlutterNativeVisionCameraPlugi
     };
 
     VisionCamera_dispatchFrame((FrameHandle)frame, metadata);
-}
-
-JNIEXPORT void JNICALL
-Java_dev_jentejan_flutter_1native_1vision_1camera_FlutterNativeVisionCameraPlugin_nativeSetFrameProcessorCallback(
-    JNIEnv* env, jobject thiz, jlong callback) {
-    VisionCamera_setFrameProcessorCallback((FrameProcessorCallback)callback);
 }
 #endif
 

@@ -43,10 +43,12 @@ void initializeVisionCamera() {
   initializeFrameBindings(_dylib);
 }
 
-/// Initializes the C++ Native Plugin showcase.
+/// Initializes the bundled **demo** C++ frame plugin (the `BrightnessPlugin`
+/// showcase in `src/VisionCamera_NativePluginExample.cpp`).
 ///
-/// This demonstrates how other developers can register C++ plugins
-/// that hook into the camera pipeline with zero latency.
+/// This is a reference/demo only — you do **not** need to call it in your app.
+/// It exists to show how to register a native C/C++ plugin that hooks the
+/// camera pipeline with zero latency; ship your own plugin the same way.
 void initializeNativeExamplePlugin() {
   final init = _dylib.lookupFunction<Void Function(), void Function()>(
     'VisionCamera_initExamplePlugin',

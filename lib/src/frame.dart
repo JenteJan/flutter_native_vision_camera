@@ -25,7 +25,9 @@ final class FrameMetadataNative extends Struct {
 /// A single frame from the camera.
 ///
 /// This class is backed by a native memory pointer (zero-copy).
-/// It allows high-performance access to the raw image data on a background Isolate.
+/// It allows low-overhead access to the raw image data. The frame-processor
+/// callback is delivered on the main isolate's event loop; copy data out (or
+/// balance [incrementRefCount]/[decrementRefCount]) before using it elsewhere.
 ///
 /// Maps to `Frame` from react-native-vision-camera.
 class Frame {
@@ -66,6 +68,18 @@ class Frame {
   /// The number of planes in the frame (e.g., 3 for YUV, 1 for RGB).
   int get planesCount => _getPlanesCount(_pointer);
 
+  /// The byte stride (bytes per row) of the given [planeIndex]. This may exceed
+  /// `width * pixelStride` because of hardware row padding, so always use it
+  /// (not [width]) when indexing into [getPlaneData].
+  int planeBytesPerRow(int planeIndex) =>
+      _getPlaneBytesPerRow(_pointer, planeIndex);
+
+  /// The pixel stride (bytes between consecutive samples) of [planeIndex].
+  /// For Android `YUV_420_888` chroma planes this is often `2` (interleaved
+  /// CbCr); tightly-packed planes are `1`; iOS BGRA is `4`.
+  int planePixelStride(int planeIndex) =>
+      _getPlanePixelStride(_pointer, planeIndex);
+
   /// Returns a [Uint8List] view of the frame's data for the given [planeIndex].
   ///
   /// This is a **direct view** of the native memory. Modifying it will
@@ -99,11 +113,14 @@ class Frame {
   /// (startX, startY, endX, endY) are pixel coordinates.
   double computeLuminance(int startX, int startY, int endX, int endY) {
     if (pixelFormat != PixelFormat.yuv) return 0.0;
-    // Use the native function directly on the Y plane pointer
+    // Use the native function directly on the Y plane pointer. The Y plane's
+    // row stride (which may exceed [width] due to hardware padding) is passed
+    // so indexing stays correct.
     return _computeLuminance(
       _getPlanePointer(_pointer, 0).cast<Uint8>(),
       width,
       height,
+      bytesPerRow,
       startX,
       startY,
       endX,
@@ -122,6 +139,11 @@ class Frame {
 typedef _GetBytesPerRowFunc = Int32 Function(Pointer<Void>);
 typedef _GetBytesPerRow = int Function(Pointer<Void>);
 late _GetBytesPerRow _getBytesPerRow;
+
+typedef _GetPlaneStrideFunc = Int32 Function(Pointer<Void>, Int32);
+typedef _GetPlaneStride = int Function(Pointer<Void>, int);
+late _GetPlaneStride _getPlaneBytesPerRow;
+late _GetPlaneStride _getPlanePixelStride;
 
 typedef _GetPlanesCountFunc = Int32 Function(Pointer<Void>);
 typedef _GetPlanesCount = int Function(Pointer<Void>);
@@ -165,6 +187,16 @@ void initializeFrameBindings(DynamicLibrary dylib) {
   try {
     _getBytesPerRow = dylib
         .lookup<NativeFunction<_GetBytesPerRowFunc>>('Frame_getBytesPerRow')
+        .asFunction();
+    _getPlaneBytesPerRow = dylib
+        .lookup<NativeFunction<_GetPlaneStrideFunc>>(
+          'Frame_getPlaneBytesPerRow',
+        )
+        .asFunction();
+    _getPlanePixelStride = dylib
+        .lookup<NativeFunction<_GetPlaneStrideFunc>>(
+          'Frame_getPlanePixelStride',
+        )
         .asFunction();
     _getPlanesCount = dylib
         .lookup<NativeFunction<_GetPlanesCountFunc>>('Frame_getPlanesCount')
@@ -219,11 +251,12 @@ typedef _ComputeLuminanceFunc =
       Pointer<Uint8> yPlane,
       Int32 width,
       Int32 height,
+      Int32 rowStride,
       Int32 startX,
       Int32 startY,
       Int32 endX,
       Int32 endY,
     );
 typedef _ComputeLuminance =
-    double Function(Pointer<Uint8>, int, int, int, int, int, int);
+    double Function(Pointer<Uint8>, int, int, int, int, int, int, int);
 late _ComputeLuminance _computeLuminance;

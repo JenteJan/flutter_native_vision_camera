@@ -28,18 +28,19 @@ public:
         // Perform a super-fast brightness calculation on a 100x100 center crop
         int width = frame.width();
         int height = frame.height();
+        int stride = frame.bytesPerRow(); // row stride (>= width due to padding)
         int centerX = width / 2;
         int centerY = height / 2;
-        
+
         long long sum = 0;
         int count = 0;
-        
-        // Sampling loop
+
+        // Sampling loop — index by the row stride, NOT width, or padded buffers skew.
         for (int y = centerY - 50; y < centerY + 50; ++y) {
             if (y < 0 || y >= height) continue;
             for (int x = centerX - 50; x < centerX + 50; ++x) {
                 if (x < 0 || x >= width) continue;
-                sum += yData[y * width + x];
+                sum += yData[y * stride + x];
                 count++;
             }
         }

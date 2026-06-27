@@ -60,7 +60,7 @@ class _HomePageState extends State<HomePage> {
             _buildFeatureCard(
               context,
               title: 'Native Vision Camera',
-              subtitle: 'High-performance zero-copy preview',
+              subtitle: 'FFI frame processor + live pixel read',
               icon: Icons.camera_enhance,
               color: Colors.blue,
               onTap: () {
@@ -72,8 +72,8 @@ class _HomePageState extends State<HomePage> {
             const SizedBox(height: 16),
             _buildFeatureCard(
               context,
-              title: 'MLKit Code Scanner',
-              subtitle: 'Real-time barcode & QR detection',
+              title: 'Barcode / QR Scanner',
+              subtitle: 'MLKit on Android · Vision on iOS',
               icon: Icons.qr_code_scanner,
               color: Colors.green,
               onTap: () {
@@ -129,7 +129,7 @@ class _HomePageState extends State<HomePage> {
               Container(
                 padding: const EdgeInsets.all(12),
                 decoration: BoxDecoration(
-                  color: color.withOpacity(0.1),
+                  color: color.withValues(alpha: 0.1),
                   borderRadius: BorderRadius.circular(12),
                 ),
                 child: Icon(icon, color: color, size: 32),

@@ -34,7 +34,8 @@ enum CameraState {
 /// * **Zero-Copy Preview**: Uses `TextureRegistry` for direct GPU rendering.
 /// * **Physical Orientation**: Correctly handles hardware sensor orientation.
 /// * **Integrated ML**: Built-in high-speed Barcode/QR scanning via MLKit.
-/// * **FFI Frame Processing**: Synchronous background frame analysis.
+/// * **FFI Frame Processing**: Low-overhead frame access via `dart:ffi`
+///   (callback on the main isolate; native C/C++ plugins on the camera thread).
 /// * **Unified API**: Easy-to-use reactive state via [ValueNotifier].
 class CameraController extends ValueNotifier<CameraState> {
   int? _textureId;
@@ -46,6 +47,9 @@ class CameraController extends ValueNotifier<CameraState> {
   FrameProcessorPipeline? _frameProcessorPipeline;
   int? _previewWidth;
   int? _previewHeight;
+  int? _previewRotationDegrees;
+  bool _previewMirrored = false;
+  bool _mirror = true;
 
   // Configuration State
   double _zoom = 1.0;
@@ -79,11 +83,56 @@ class CameraController extends ValueNotifier<CameraState> {
   /// The currently active camera device.
   CameraDevice? get device => _device;
 
-  /// The width of the preview texture.
+  /// The width of the preview texture, in raw sensor space (un-rotated).
   int? get previewWidth => _previewWidth;
 
-  /// The height of the preview texture.
+  /// The height of the preview texture, in raw sensor space (un-rotated).
   int? get previewHeight => _previewHeight;
+
+  /// The clockwise quarter-turns needed to rotate the raw preview texture so
+  /// it displays upright.
+  ///
+  /// **This is the single source of truth for preview rotation.** The value is
+  /// reported by the native layer, which is the only place that knows how much
+  /// the preview buffer was already rotated (the camera stack may pre-rotate it
+  /// depending on the bound use-cases, device orientation and sensor mount).
+  /// [CameraPreview] applies this for you; custom previews/overlays must use
+  /// this value (or [displayPreviewSize]) instead of swapping/rotating
+  /// dimensions themselves. Falls back to the device's
+  /// [CameraDevice.sensorOrientation] before the native value arrives.
+  int get previewRotation {
+    final degrees =
+        _previewRotationDegrees ?? _device?.sensorOrientation.degrees ?? 0;
+    return (degrees ~/ 90) % 4;
+  }
+
+  /// The raw preview buffer size, in sensor space (before [previewRotation]).
+  Size? get rawPreviewSize => (_previewWidth != null && _previewHeight != null)
+      ? Size(_previewWidth!.toDouble(), _previewHeight!.toDouble())
+      : null;
+
+  /// The preview size in display (upright) space, accounting for
+  /// [previewRotation]. Lay out overlays against this so they align with the
+  /// rotated preview.
+  Size? get displayPreviewSize {
+    final raw = rawPreviewSize;
+    if (raw == null) return null;
+    return previewRotation.isOdd ? Size(raw.height, raw.width) : raw;
+  }
+
+  /// Whether the native preview texture is already horizontally mirrored
+  /// relative to the true scene.
+  ///
+  /// Reported by the native layer because the camera stacks differ: Android's
+  /// CameraX mirrors the front-camera preview itself, while iOS delivers an
+  /// un-mirrored buffer. [CameraPreview] uses this so the front preview looks
+  /// like a mirror on both platforms without double-mirroring.
+  bool get previewMirrored => _previewMirrored;
+
+  /// Whether the front camera is mirrored (the "selfie" look) for **both** the
+  /// preview and the captured photo/video. Set via [initialize]'s `mirror`
+  /// argument. Has no effect on back cameras.
+  bool get mirror => _mirror;
 
   /// Fires when a runtime error occurs in the native layer.
   Stream<CameraError> get onError => _onErrorController.stream;
@@ -99,8 +148,14 @@ class CameraController extends ValueNotifier<CameraState> {
   /// Initializes the camera with the specified [device].
   ///
   /// [format] controls resolution and FPS.
-  /// [enablePhoto] and [enableVideo] prepare the underlying pipeline.
+  /// [pixelFormat] hints the desired frame-processor format (use
+  /// [PixelFormat.rgb] if your processor expects RGB/BGRA).
+  /// [enablePhoto] and [enableVideo] prepare the underlying pipeline — they are
+  /// required before [takePhoto] / [startRecording] respectively.
   /// [codeScanner] enables the high-speed barcode scanning features.
+  /// [mirror] mirrors the **front** camera (the selfie look) for both the
+  /// preview and the captured photo/video; defaults to `true`. Ignored for back
+  /// cameras. See [mirror].
   Future<void> initialize(
     CameraDevice device, {
     CameraDeviceFormat? format,
@@ -108,11 +163,27 @@ class CameraController extends ValueNotifier<CameraState> {
     bool enablePhoto = false,
     bool enableVideo = false,
     CodeScannerConfiguration? codeScanner,
+    bool mirror = true,
   }) async {
     if (value == CameraState.disposed) return;
 
     try {
+      // Tear down any frame processor from a previous session before re-init /
+      // device-switch, so frames already queued from the old session don't read
+      // buffers the native side is about to recycle (use-after-free).
+      _frameProcessorPipeline?.stop();
+      _frameProcessorPipeline = null;
+
       _device = device;
+      _previewRotationDegrees = null;
+      _previewMirrored = false;
+      _mirror = mirror;
+      // Reset per-session state so re-init / device-switch starts clean.
+      _isActive = false;
+      _isRecording = false;
+      _textureId = null;
+      _previewWidth = null;
+      _previewHeight = null;
 
       _activeHandler = this;
       _channel.setMethodCallHandler(_handleMethodCall);
@@ -127,6 +198,7 @@ class CameraController extends ValueNotifier<CameraState> {
             'enablePhoto': enablePhoto,
             'enableVideo': enableVideo,
             'codeScanner': codeScanner?.toMap(),
+            'mirror': mirror,
           });
 
       if (result != null) {
@@ -189,7 +261,11 @@ class CameraController extends ValueNotifier<CameraState> {
     }
   }
 
-  /// Changes the manual exposure compensation.
+  /// Changes the exposure compensation, in the device's exposure units
+  /// (an EV-bias index on Android; an exposure-target bias on iOS). Clamp to
+  /// [CameraDevice.minExposure]..[CameraDevice.maxExposure].
+  ///
+  /// No-op unless the camera is active (call [setActive] first).
   Future<void> setExposure(double exposure) async {
     if (!_isActive) return;
     try {
@@ -251,8 +327,12 @@ class CameraController extends ValueNotifier<CameraState> {
 
   /// Sets the frame processor for this camera session.
   ///
-  /// The [callback] will be executed on a background isolate for every frame.
-  /// Set to `null` to disable frame processing.
+  /// The [callback] is invoked for every frame, delivered **asynchronously on
+  /// the main isolate's event loop** (via `dart:ffi` `NativeCallable.listener`).
+  /// It does **not** run on a background isolate and does **not** block the
+  /// camera thread — keep the work light, or copy data out and hand it to your
+  /// own isolate. For the heaviest work, register a native C/C++ plugin, which
+  /// runs synchronously on the camera thread. Pass `null` to disable.
   Future<void> setFrameProcessor(FrameProcessorCallback? callback) async {
     _frameProcessorPipeline?.stop();
     _frameProcessorPipeline = null;
@@ -286,6 +366,9 @@ class CameraController extends ValueNotifier<CameraState> {
   /// Takes a snapshot of the current preview.
   ///
   /// Snapshots are usually faster than high-resolution photos.
+  ///
+  /// **iOS only** — not implemented on Android; use [takePhoto] there. On
+  /// Android this throws a [PlatformException] with code `NOT_IMPLEMENTED`.
   Future<PhotoFile> takeSnapshot([TakeSnapshotOptions? options]) async {
     final result = await _channel.invokeMapMethod<String, dynamic>(
       'takeSnapshot',
@@ -339,6 +422,12 @@ class CameraController extends ValueNotifier<CameraState> {
       switch (call.method) {
         case 'onInitialized':
           _isInitialized = true;
+          break;
+        case 'onPreviewConfigurationChanged':
+          final args = Map<String, dynamic>.from(call.arguments as Map);
+          _previewRotationDegrees = (args['rotationDegrees'] as num).toInt();
+          _previewMirrored = (args['mirrored'] as bool?) ?? false;
+          notifyListeners();
           break;
         case 'onStarted':
           _isActive = true;

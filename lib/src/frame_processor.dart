@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:ffi';
-import 'dart:isolate';
+
+import 'package:flutter/foundation.dart';
 
 import 'frame.dart';
 import 'types/orientation.dart';
@@ -8,136 +9,113 @@ import 'types/pixel_format.dart';
 
 /// The signature of a frame processor callback.
 ///
-/// This callback is executed on a background Isolate for every frame.
+/// This callback is invoked for every camera frame.
+///
+/// ## Threading
+/// The callback is delivered **asynchronously on the main isolate's event
+/// loop** via `dart:ffi` [NativeCallable.listener]. It does **not** run on a
+/// separate background isolate and it does **not** block the camera thread.
+/// Keep the work light, or copy the data out and hand it to your own isolate.
+/// For the heaviest work, register a synchronous native C/C++ plugin instead,
+/// which runs on the camera thread with zero added latency.
 typedef FrameProcessorCallback = void Function(Frame frame);
 
-/// Manages the background Isolate and communication for frame processors.
+/// Manages the native frame-processor callback for a camera session.
+///
+/// Each pipeline owns its own [NativeCallable]; only one pipeline should be
+/// active per native frame source at a time (the C layer holds a single
+/// callback slot).
 class FrameProcessorPipeline {
-  final FrameProcessorCallback callback;
-  final ReceivePort _receivePort = ReceivePort();
-  Isolate? _isolate;
-  SendPort? _mainToIsolateSendPort;
-
+  /// Creates a pipeline that forwards native frames to [callback].
   FrameProcessorPipeline(this.callback);
 
-  static late NativeCallable<NativeFrameProcessorCallbackFunc> _nativeCallable;
-  static SendPort? _currentIsolateSendPort;
+  /// The user-provided frame processor.
+  final FrameProcessorCallback callback;
 
-  /// Initializes the pipeline and starts the background Isolate.
+  NativeCallable<NativeFrameProcessorCallbackFunc>? _nativeCallable;
+  bool _stopped = false;
+
+  /// Registers the native callback so frames begin flowing to [callback].
   Future<void> start() async {
-    _nativeCallable = NativeCallable.listener(_staticFrameCallback);
-    setNativeFrameProcessorCallback(_nativeCallable.nativeFunction);
-
-    _isolate = await Isolate.spawn(_isolateEntry, _receivePort.sendPort);
-
-    // Wait for the isolate to send its SendPort
-    final completer = Completer<SendPort>();
-    _receivePort.listen((message) {
-      if (message is SendPort) {
-        completer.complete(message);
-      } else {
-        _handleMessage(message);
-      }
-    });
-
-    _mainToIsolateSendPort = await completer.future;
-    _currentIsolateSendPort = _mainToIsolateSendPort;
+    _stopped = false;
+    final callable = NativeCallable<NativeFrameProcessorCallbackFunc>.listener(
+      _onNativeFrame,
+    );
+    _nativeCallable = callable;
+    setNativeFrameProcessorCallback(callable.nativeFunction);
   }
 
-  void _handleMessage(dynamic message) {
-    if (message is Map<String, dynamic>) {
-      // Map native format codes to PixelFormat enum
-      final int nativeFormat = message['pixelFormat'] as int;
-      PixelFormat pixelFormat;
-      switch (nativeFormat) {
-        case 35: // android.graphics.ImageFormat.YUV_420_888
-        case 842094169: // android.graphics.ImageFormat.YV12
-          pixelFormat = PixelFormat.yuv;
-          break;
-        case 1: // android.graphics.ImageFormat.RGB_565 (approx)
-        case 22: // android.graphics.ImageFormat.RGBA_8888
-          pixelFormat = PixelFormat.rgb;
-          break;
-        default:
-          if (nativeFormat >= 0 && nativeFormat < PixelFormat.values.length) {
-            pixelFormat = PixelFormat.values[nativeFormat];
-          } else {
-            pixelFormat = PixelFormat.unknown;
-          }
+  /// Invoked asynchronously on the main isolate for each dispatched frame.
+  ///
+  /// The native side has taken a reference on our behalf; we are responsible
+  /// for releasing it via [Frame.decrementRefCount] exactly once — even if the
+  /// pipeline was stopped between dispatch and delivery, or the user callback
+  /// throws.
+  void _onNativeFrame(Pointer<Void> handle, FrameMetadataNative metadata) {
+    final frame = Frame(
+      handle,
+      width: metadata.width,
+      height: metadata.height,
+      pixelFormat: _mapPixelFormat(metadata.pixelFormat),
+      orientation: _mapOrientation(metadata.orientation),
+      timestamp: metadata.timestamp,
+    );
+    try {
+      if (!_stopped) callback(frame);
+    } catch (e, stack) {
+      // A throwing frame processor must not tear down the listener or leak
+      // the frame; log and continue.
+      if (kDebugMode) {
+        debugPrint('FrameProcessor callback threw: $e\n$stack');
       }
-
-      // Map native orientation degrees to Orientation enum
-      final int nativeOrientation = message['orientation'] as int;
-      Orientation orientation;
-      switch (nativeOrientation) {
-        case 0:
-          orientation = Orientation.portrait;
-          break;
-        case 90:
-          orientation = Orientation.landscapeLeft;
-          break;
-        case 180:
-          orientation = Orientation.portraitUpsideDown;
-          break;
-        case 270:
-          orientation = Orientation.landscapeRight;
-          break;
-        default:
-          if (nativeOrientation >= 0 &&
-              nativeOrientation < Orientation.values.length) {
-            orientation = Orientation.values[nativeOrientation];
-          } else {
-            orientation = Orientation.portrait;
-          }
-      }
-
-      final frame = Frame(
-        Pointer.fromAddress(message['pointer'] as int),
-        width: message['width'] as int,
-        height: message['height'] as int,
-        pixelFormat: pixelFormat,
-        orientation: orientation,
-        timestamp: message['timestamp'] as double,
-      );
-
-      try {
-        callback(frame);
-      } finally {
-        frame.decrementRefCount();
-      }
+    } finally {
+      frame.decrementRefCount();
     }
   }
 
-  static void _staticFrameCallback(
-    Pointer<Void> handle,
-    FrameMetadataNative metadata,
-  ) {
-    _currentIsolateSendPort?.send({
-      'pointer': handle.address,
-      'width': metadata.width,
-      'height': metadata.height,
-      'pixelFormat': metadata.pixelFormat,
-      'orientation': metadata.orientation,
-      'timestamp': metadata.timestamp,
-    });
-  }
-
-  static void _isolateEntry(SendPort mainSendPort) {
-    final receivePort = ReceivePort();
-    mainSendPort.send(receivePort.sendPort);
-
-    receivePort.listen((message) {
-      mainSendPort.send(message);
-    });
-  }
-
-  /// Stops the pipeline and kills the Isolate.
+  /// Unregisters the native callback and releases the [NativeCallable].
   void stop() {
-    _nativeCallable.close();
+    _stopped = true;
+    // Detach the native side first so no new frames are dispatched into a
+    // callable we are about to close.
     setNativeFrameProcessorCallback(nullptr);
-    _isolate?.kill();
-    _receivePort.close();
-    _currentIsolateSendPort = null;
+    _nativeCallable?.close();
+    _nativeCallable = null;
+  }
+
+  static PixelFormat _mapPixelFormat(int nativeFormat) {
+    switch (nativeFormat) {
+      case 35: // android.graphics.ImageFormat.YUV_420_888
+      case 842094169: // android.graphics.ImageFormat.YV12
+        return PixelFormat.yuv;
+      case 1: // BGRA (iOS) / RGB family
+      case 22: // android.graphics.ImageFormat.RGBA_8888
+        return PixelFormat.rgb;
+      default:
+        if (nativeFormat >= 0 && nativeFormat < PixelFormat.values.length) {
+          return PixelFormat.values[nativeFormat];
+        }
+        return PixelFormat.unknown;
+    }
+  }
+
+  static Orientation _mapOrientation(int nativeOrientation) {
+    switch (nativeOrientation) {
+      case 0:
+        return Orientation.portrait;
+      case 90:
+        return Orientation.landscapeLeft;
+      case 180:
+        return Orientation.portraitUpsideDown;
+      case 270:
+        return Orientation.landscapeRight;
+      default:
+        if (nativeOrientation >= 0 &&
+            nativeOrientation < Orientation.values.length) {
+          return Orientation.values[nativeOrientation];
+        }
+        return Orientation.portrait;
+    }
   }
 }
 
@@ -145,11 +123,14 @@ class FrameProcessorPipeline {
 ///
 /// Maps to `runAtTargetFps` from react-native-vision-camera.
 class FrameProcessorThrottler {
+  /// Creates a throttler that admits at most [targetFps] frames per second.
+  FrameProcessorThrottler({required this.targetFps});
+
+  /// The maximum number of frames to process per second.
   final int targetFps;
   int _lastProcessedTimestamp = 0;
 
-  FrameProcessorThrottler({required this.targetFps});
-
+  /// Returns `true` if a frame at [timestampMs] should be processed.
   bool shouldProcess(int timestampMs) {
     final interval = 1000 ~/ targetFps;
     if (timestampMs - _lastProcessedTimestamp >= interval) {

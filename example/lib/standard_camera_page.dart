@@ -164,10 +164,11 @@ class _StandardCameraPageState extends State<StandardCameraPage> {
     try {
       await _controller!.setFocusPoint(offset);
       await _controller!.setExposurePoint(offset);
-      if (mounted)
+      if (mounted) {
         _showSnackbar(
           'Focused at ${offset.dx.toStringAsFixed(2)}, ${offset.dy.toStringAsFixed(2)}',
         );
+      }
     } on official.CameraException catch (e) {
       debugPrint('Focus failed: $e');
     }
