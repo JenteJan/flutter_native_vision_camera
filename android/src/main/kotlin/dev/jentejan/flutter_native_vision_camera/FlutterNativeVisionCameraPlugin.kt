@@ -57,9 +57,16 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
     private lateinit var lifecycleRegistry: LifecycleRegistry
     override val lifecycle: Lifecycle get() = lifecycleRegistry
 
-    // Native dispatcher
-    private external fun nativeDispatchFrame(buffer: java.nio.ByteBuffer, width: Int, height: Int, format: Int, orientation: Int, timestamp: Double, id: Long, address: Long)
-    private external fun nativeSetFrameProcessorCallback(callback: Long)
+    // Native dispatcher. Passes every image plane (with its row/pixel stride and
+    // byte size) so the Dart/C++ side can read true multi-plane YUV.
+    private external fun nativeDispatchFrame(
+        p0: java.nio.ByteBuffer, p1: java.nio.ByteBuffer?, p2: java.nio.ByteBuffer?,
+        rs0: Int, rs1: Int, rs2: Int,
+        ps0: Int, ps1: Int, ps2: Int,
+        sz0: Int, sz1: Int, sz2: Int,
+        numPlanes: Int,
+        width: Int, height: Int, format: Int, orientation: Int, timestamp: Double, id: Long
+    )
 
     private lateinit var channel: MethodChannel
     private lateinit var textureRegistry: TextureRegistry
@@ -67,6 +74,7 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
     private var activity: Activity? = null
     private var binding: ActivityPluginBinding? = null
     private var pendingPermissionResult: MethodChannel.Result? = null
+    private var pendingMicPermissionResult: MethodChannel.Result? = null
 
     // CameraX components
     private var cameraProvider: ProcessCameraProvider? = null
@@ -92,6 +100,7 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
     private var barcodeScanner: BarcodeScanner? = null
     @Volatile private var isCodeScannerEnabled = false
     private var currentFormat: Map<String, Any>? = null
+    private var mirrorCaptures: Boolean = false
     
     private var recordingStartTime: Long = 0
     private var pendingVideoResult: MethodChannel.Result? = null
@@ -112,6 +121,7 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
     companion object {
         private const val CHANNEL_NAME = "dev.jentejan.flutter_native_vision_camera/camera"
         private const val CAMERA_PERMISSION_REQUEST = 1001
+        private const val MIC_PERMISSION_REQUEST = 1002
 
         private val frameIdCounter = AtomicLong(0)
 
@@ -133,6 +143,13 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
                 return 0
             }
             return currentCount
+        }
+
+        @JvmStatic
+        @androidx.annotation.Keep
+        fun retainFrame(id: Long): Int {
+            val managed = activeFrames[id] ?: return 0
+            return managed.refCount.incrementAndGet()
         }
 
         fun clearFrames() {
@@ -178,12 +195,20 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
         orientationEventListener = object : OrientationEventListener(context) {
             override fun onOrientationChanged(orientation: Int) {
                 if (orientation == ORIENTATION_UNKNOWN) return
-                physicalOrientation = when {
+                val newRotation = when {
                     orientation < 45 || orientation > 315 -> Surface.ROTATION_0
                     orientation in 45..134 -> Surface.ROTATION_270
                     orientation in 135..224 -> Surface.ROTATION_180
                     orientation in 225..314 -> Surface.ROTATION_90
                     else -> Surface.ROTATION_0
+                }
+                if (newRotation != physicalOrientation) {
+                    physicalOrientation = newRotation
+                    // Keep capture outputs correctly oriented from the physical
+                    // sensor angle, even when the UI is orientation-locked.
+                    imageCapture?.targetRotation = newRotation
+                    videoCapture?.targetRotation = newRotation
+                    imageAnalysis?.targetRotation = newRotation
                 }
             }
         }
@@ -229,6 +254,7 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
                 val enablePhoto = call.argument<Boolean>("enablePhoto") ?: false
                 val enableVideo = call.argument<Boolean>("enableVideo") ?: false
                 val codeScanner = call.argument<Map<String, Any>>("codeScanner")
+                mirrorCaptures = call.argument<Boolean>("mirror") ?: true
                 initializeCamera(deviceId, format, enablePhoto, enableVideo, codeScanner, result)
             }
             "setActive" -> {
@@ -469,10 +495,10 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
             CameraSelector.DEFAULT_BACK_CAMERA
         } else {
             CameraSelector.Builder().addCameraFilter { cameras ->
-                cameras.filter { 
+                cameras.filter {
                     val info = Camera2CameraInfo.from(it)
                     if (info.cameraId == deviceId) {
-                        isFrontCamera = it.cameraInfo.lensFacing == CameraSelector.LENS_FACING_FRONT
+                        isFrontCamera = it.lensFacing == CameraSelector.LENS_FACING_FRONT
                         true
                     } else false
                 }
@@ -507,9 +533,27 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
             .build()
         
         previewUseCase.setSurfaceProvider(cameraExecutor) { request ->
+            // CameraX is the authority on how much the preview buffer must be
+            // rotated to display upright — it accounts for sensor orientation,
+            // target rotation AND use-case negotiation (which can pre-rotate the
+            // buffer). Report it to Dart so a single source of truth drives the
+            // preview rotation. This also re-fires on device rotation.
+            request.setTransformationInfoListener(cameraExecutor) { info ->
+                val degrees = info.rotationDegrees
+                // CameraX mirrors the front-camera preview itself; report that so
+                // the Dart side doesn't double-mirror it.
+                val mirrored = isFrontCamera
+                mainHandler.post {
+                    channel.invokeMethod(
+                        "onPreviewConfigurationChanged",
+                        mapOf("rotationDegrees" to degrees, "mirrored" to mirrored)
+                    )
+                }
+            }
+
             val res = request.resolution
             Log.d("CameraPlugin", "CameraX requesting preview surface: ${res.width}x${res.height}")
-            
+
             // Important: Set size before providing surface
             producer.setSize(res.width, res.height)
             val surface = producer.surface
@@ -642,18 +686,31 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
                 }
             }
 
-            // Dispatch to Native/C++ (Synchronous)
+            // Dispatch to Native/C++ (synchronous). Pass every plane with its
+            // row/pixel stride and byte size so Dart can read true multi-plane YUV.
             managed.refCount.incrementAndGet()
-            val yBuffer = image.planes[0].buffer
+            val planes = image.planes
+            val b0 = planes[0].buffer
+            val b1 = if (planes.size > 1) planes[1].buffer else null
+            val b2 = if (planes.size > 2) planes[2].buffer else null
             nativeDispatchFrame(
-                yBuffer, 
-                image.width, 
-                image.height, 
+                b0, b1, b2,
+                planes[0].rowStride,
+                if (planes.size > 1) planes[1].rowStride else 0,
+                if (planes.size > 2) planes[2].rowStride else 0,
+                planes[0].pixelStride,
+                if (planes.size > 1) planes[1].pixelStride else 0,
+                if (planes.size > 2) planes[2].pixelStride else 0,
+                b0.remaining(),
+                b1?.remaining() ?: 0,
+                b2?.remaining() ?: 0,
+                planes.size,
+                image.width,
+                image.height,
                 0x23, // YUV_420_888
-                image.imageInfo.rotationDegrees, 
-                image.imageInfo.timestamp.toDouble() / 1e9, 
-                id, 
-                0L
+                image.imageInfo.rotationDegrees,
+                image.imageInfo.timestamp.toDouble() / 1e9,
+                id
             )
         } finally {
             releaseFrame(id)
@@ -681,7 +738,14 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
             File(context.cacheDir, "photo_${System.currentTimeMillis()}.jpg")
         }
 
-        val outputOptions = ImageCapture.OutputFileOptions.Builder(file).build()
+        val metadata = ImageCapture.Metadata().apply {
+            // Mirror the saved image only when explicitly requested (selfie
+            // mirror); otherwise save what the camera actually sees.
+            isReversedHorizontal = mirrorCaptures && isFrontCamera
+        }
+        val outputOptions = ImageCapture.OutputFileOptions.Builder(file)
+            .setMetadata(metadata)
+            .build()
 
         capture.takePicture(outputOptions, cameraExecutor, object : ImageCapture.OnImageSavedCallback {
             override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
@@ -690,8 +754,8 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
                         "path" to file.absolutePath,
                         "width" to (currentFormat?.get("photoWidth") ?: 1920),
                         "height" to (currentFormat?.get("photoHeight") ?: 1080),
-                        "orientation" to "portrait",
-                        "isMirrored" to isFrontCamera
+                        "orientation" to rotationToOrientationString(physicalOrientation),
+                        "isMirrored" to (mirrorCaptures && isFrontCamera)
                     ))
                 }
             }
@@ -723,10 +787,21 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
         val file = File(outputFilePath)
         val outOptions = FileOutputOptions.Builder(file).build()
 
-        activeRecording = capture.output
-            .prepareRecording(context, outOptions)
-            .withAudioEnabled()
-            .start(cameraExecutor) { event ->
+        // Only enable audio when RECORD_AUDIO has actually been granted —
+        // calling withAudioEnabled() without the permission throws.
+        val hasAudio = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+
+        try {
+            var pending = capture.output.prepareRecording(context, outOptions)
+            if (hasAudio) {
+                pending = pending.withAudioEnabled()
+            } else {
+                Log.w("CameraPlugin", "RECORD_AUDIO not granted — recording video without audio")
+            }
+
+            activeRecording = pending.start(cameraExecutor) { event ->
                 when (event) {
                     is VideoRecordEvent.Start -> {
                         recordingStartTime = System.currentTimeMillis()
@@ -735,7 +810,15 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
                     is VideoRecordEvent.Finalize -> {
                         if (event.hasError()) {
                             Log.e("CameraPlugin", "Video recording error: ${event.error}")
-                            // Handle error if needed
+                            // Surface the failure to whichever call is still pending:
+                            // the start() future if it errored before Start, otherwise
+                            // the stop() future.
+                            mainHandler.post {
+                                safeResult.error("RECORDING_ERROR", "Recording failed (code ${event.error})", null)
+                                pendingVideoResult?.error("RECORDING_ERROR", "Recording failed (code ${event.error})", null)
+                                pendingVideoResult = null
+                            }
+                            return@start
                         }
                         val duration = (event.recordingStats.recordedDurationNanos / 1e9)
                         val metadata = mapOf(
@@ -751,6 +834,10 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
                     }
                 }
             }
+        } catch (e: Exception) {
+            Log.e("CameraPlugin", "Failed to start recording: ${e.message}")
+            safeResult.error("RECORDING_ERROR", "Failed to start recording: ${e.message}", null)
+        }
     }
 
     private fun stopRecording(result: MethodChannel.Result) {
@@ -798,11 +885,10 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
     }
 
     private fun focus(x: Double, y: Double, result: MethodChannel.Result) {
-        val videoWidth = currentFormat?.get("videoWidth") as? Int ?: 1920
-        val videoHeight = currentFormat?.get("videoHeight") as? Int ?: 1080
-        
-        val factory = SurfaceOrientedMeteringPointFactory(videoWidth.toFloat(), videoHeight.toFloat())
-        val point = factory.createPoint(x.toFloat(), y.toFloat())
+        // x,y arrive already normalized to 0..1 in sensor space (the widget maps
+        // through BoxFit and front-mirror), so use a unit-sized factory.
+        val factory = SurfaceOrientedMeteringPointFactory(1f, 1f)
+        val point = factory.createPoint(x.toFloat().coerceIn(0f, 1f), y.toFloat().coerceIn(0f, 1f))
         val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
             .setAutoCancelDuration(5, TimeUnit.SECONDS)
             .build()
@@ -815,6 +901,14 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
         // CameraX does not provide direct "manual focal distance" API in diopters like Camera2 easily
         // Usually handled via Camera2Interop if needed.
         result.notImplemented()
+    }
+
+    private fun rotationToOrientationString(rotation: Int): String = when (rotation) {
+        Surface.ROTATION_0 -> "portrait"
+        Surface.ROTATION_90 -> "landscape-right"
+        Surface.ROTATION_180 -> "portrait-upside-down"
+        Surface.ROTATION_270 -> "landscape-left"
+        else -> "portrait"
     }
 
     // ─── Code Scanner Utilities ────────────────────────────────────────
@@ -925,6 +1019,16 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
             pendingPermissionResult = null
             return true
         }
+        if (requestCode == MIC_PERMISSION_REQUEST) {
+            val pendingResult = pendingMicPermissionResult ?: return false
+            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                pendingResult.success("granted")
+            } else {
+                pendingResult.success("denied")
+            }
+            pendingMicPermissionResult = null
+            return true
+        }
         return false
     }
 
@@ -934,12 +1038,16 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
     }
 
     private fun requestMicrophonePermission(result: MethodChannel.Result) {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            result.success("granted")
+            return
+        }
         val act = activity ?: run {
             result.error("NO_ACTIVITY", "Activity not available", null)
             return
         }
-        ActivityCompat.requestPermissions(act, arrayOf(Manifest.permission.RECORD_AUDIO), CAMERA_PERMISSION_REQUEST + 1)
-        result.success("granted") 
+        pendingMicPermissionResult = result
+        ActivityCompat.requestPermissions(act, arrayOf(Manifest.permission.RECORD_AUDIO), MIC_PERMISSION_REQUEST)
     }
 
     // ─── Lifecycle & Cleanup ──────────────────────────────────────────
