@@ -10,6 +10,12 @@ ML/CV code, integrated barcode/QR scanning, and full hardware control.
 > **Device-verified** on Android (Pixel 8) and iOS 18: preview, photo, video
 > recording, barcode/QR scanning, zoom/torch/focus, orientation, and mirroring.
 
+## Demo
+
+| Preview + orientation | Barcode / QR scanning | FFI frame processor |
+|:---------------------:|:---------------------:|:-------------------:|
+| ![preview](https://raw.githubusercontent.com/JenteJan/flutter_native_vision_camera/main/doc/preview.gif) | ![scanner](https://raw.githubusercontent.com/JenteJan/flutter_native_vision_camera/main/doc/scanner.gif) | ![frame processor](https://raw.githubusercontent.com/JenteJan/flutter_native_vision_camera/main/doc/frame_processor.gif) |
+
 ## Why use this instead of `camera`?
 
 The official [`camera`](https://pub.dev/packages/camera) package is excellent for
