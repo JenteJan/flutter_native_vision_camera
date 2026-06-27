@@ -1,0 +1,32 @@
+# NOTE: a .pubignore REPLACES .gitignore for `pub publish`, so we mirror the
+# build/tooling exclusions here AND exclude the demo GIFs (the README references
+# them via raw GitHub URLs, so they live in git but not in the published package).
+
+# Demo media
+doc/
+
+# Build & tooling artifacts (mirrors .gitignore)
+build/
+**/build/
+.dart_tool/
+**/.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+/pubspec.lock
+**/doc/api/
+.symlinks/
+**/.symlinks/
+.swiftpm/
+.idea/
+.vscode/
+*.iml
+.DS_Store
+*.log
+
+# Example app native build outputs
+**/ios/Pods/
+**/ios/Flutter/ephemeral/
+**/android/.gradle/
+**/.last_build_id

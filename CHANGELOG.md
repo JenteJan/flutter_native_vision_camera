@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.0.5
+
+* **Docs:** added demo GIFs to the README (live preview + orientation, barcode/QR scanning with overlay,
+  and the FFI frame processor's live brightness read). The GIFs live in the repo and are referenced by raw
+  URL, so they're excluded from the published package.
+
 ## 0.0.4
 
 Correctness, honesty, and packaging pass.
