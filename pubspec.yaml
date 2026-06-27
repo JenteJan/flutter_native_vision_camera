@@ -1,6 +1,6 @@
 name: flutter_native_vision_camera
 description: "High-performance Flutter FFI camera plugin with zero-copy preview textures, integrated MLKit/Vision barcode scanning, and low-latency native frame access for real-time on-device vision."
-version: 0.0.5
+version: 0.0.6
 homepage: https://github.com/JenteJan/flutter_native_vision_camera
 repository: https://github.com/JenteJan/flutter_native_vision_camera
 issue_tracker: https://github.com/JenteJan/flutter_native_vision_camera/issues

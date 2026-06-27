@@ -5,6 +5,10 @@
 # Demo media
 doc/
 
+# The example's bundled ML model (git-tracked so the example runs, but ~5 MB —
+# kept out of the published package).
+**/*.tflite
+
 # Build & tooling artifacts (mirrors .gitignore)
 build/
 **/build/

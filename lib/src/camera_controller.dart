@@ -134,6 +134,71 @@ class CameraController extends ValueNotifier<CameraState> {
   /// argument. Has no effect on back cameras.
   bool get mirror => _mirror;
 
+  /// Maps a [normalizedRect] (each side in 0..1) from a camera frame's own
+  /// coordinate space into normalized preview-display coordinates (0..1) — the
+  /// missing piece for drawing ML detection boxes on top of [CameraPreview].
+  ///
+  /// Pass the rotation you applied to the frame before running your model in
+  /// [sourceRotationDegrees] — typically `frame.orientation.degrees` (the same
+  /// value you hand to MLKit/Vision). Pass `0` if you ran the model on the raw,
+  /// unrotated frame. The result accounts for the live [previewRotation] and the
+  /// front-camera mirror, so the box lines up with what the preview shows **at
+  /// any device orientation**.
+  ///
+  /// Scale the returned rect onto the preview widget's rect (use
+  /// [displayPreviewSize] to honour the `BoxFit`). Without this, boxes drift as
+  /// the phone turns, because the preview rotation and the frame orientation are
+  /// tracked independently.
+  ///
+  /// ```dart
+  /// final previewRect = controller.previewRectFromFrame(
+  ///   detection.boundingBox, // normalized 0..1 from your model
+  ///   sourceRotationDegrees: frame.orientation.degrees,
+  /// );
+  /// ```
+  Rect previewRectFromFrame(
+    Rect normalizedRect, {
+    required int sourceRotationDegrees,
+  }) {
+    final delta =
+        (((previewRotation * 90 - sourceRotationDegrees) % 360) + 360) % 360;
+    var r = _rotateUnitRect(normalizedRect, delta ~/ 90);
+    // The delivered frame is the un-mirrored scene; the preview is mirrored only
+    // for a front camera with [mirror] on.
+    if (_device?.position == CameraPosition.front && _mirror) {
+      r = Rect.fromLTRB(1 - r.right, r.top, 1 - r.left, r.bottom);
+    }
+    return r;
+  }
+
+  /// Rotates a unit-square rect by [k] quarter-turns clockwise, returning the
+  /// axis-aligned bounds of the rotated corners.
+  static Rect _rotateUnitRect(Rect b, int k) {
+    if (k % 4 == 0) return b;
+    var minX = 1.0, minY = 1.0, maxX = 0.0, maxY = 0.0;
+    for (final c in [b.topLeft, b.topRight, b.bottomRight, b.bottomLeft]) {
+      final double px, py;
+      switch (k % 4) {
+        case 1:
+          px = 1 - c.dy;
+          py = c.dx;
+          break;
+        case 2:
+          px = 1 - c.dx;
+          py = 1 - c.dy;
+          break;
+        default:
+          px = c.dy;
+          py = 1 - c.dx;
+      }
+      if (px < minX) minX = px;
+      if (py < minY) minY = py;
+      if (px > maxX) maxX = px;
+      if (py > maxY) maxY = py;
+    }
+    return Rect.fromLTRB(minX, minY, maxX, maxY);
+  }
+
   /// Fires when a runtime error occurs in the native layer.
   Stream<CameraError> get onError => _onErrorController.stream;
 

@@ -229,6 +229,24 @@ frame.incrementRefCount();              // keep the buffer alive
 frame.decrementRefCount();              // release it (mandatory)
 ```
 
+### Drawing ML detection boxes on the preview
+
+Detection boxes are in the frame's coordinate space; the preview is rotated (and
+maybe mirrored) for display, and the two are tracked **independently** — so a box
+drawn naively drifts as the device turns. Map it with `previewRectFromFrame`:
+
+```dart
+final previewRect = controller.previewRectFromFrame(
+  detection.boundingBox,                      // normalized 0..1 from your model
+  sourceRotationDegrees: frame.orientation.degrees, // rotation you fed the model
+);
+// Scale previewRect onto the preview widget's rect (use displayPreviewSize for BoxFit).
+```
+
+It accounts for the live `previewRotation` and the front-camera mirror, so boxes
+stay aligned at any orientation. See the example's **Object Detector** page for a
+full EfficientDet-Lite0 overlay.
+
 ### High-performance native C/C++ plugin
 
 For the heaviest work, hook the synchronous frame loop in C++ (`src/VisionCamera.hpp`):
