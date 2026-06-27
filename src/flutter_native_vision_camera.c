@@ -110,6 +110,36 @@ FFI_PLUGIN_EXPORT int32_t Frame_getBytesPerRow(FrameHandle handle) {
 #endif
 }
 
+FFI_PLUGIN_EXPORT int32_t Frame_getPlaneBytesPerRow(FrameHandle handle, int32_t planeIndex) {
+    if (handle == NULL) return 0;
+#ifdef ANDROID
+    NativeFrame* frame = (NativeFrame*)handle;
+    if (frame->magic != FRAME_MAGIC) return 0;
+    if (planeIndex < 0 || planeIndex >= (int32_t)frame->numPlanes) return 0;
+    return frame->rowStrides[planeIndex];
+#else
+    CVPixelBufferRef pixelBuffer = (CVPixelBufferRef)handle;
+    if (CVPixelBufferIsPlanar(pixelBuffer)) {
+        return (int32_t)CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, planeIndex);
+    }
+    return (int32_t)CVPixelBufferGetBytesPerRow(pixelBuffer);
+#endif
+}
+
+FFI_PLUGIN_EXPORT int32_t Frame_getPlanePixelStride(FrameHandle handle, int32_t planeIndex) {
+    if (handle == NULL) return 0;
+#ifdef ANDROID
+    NativeFrame* frame = (NativeFrame*)handle;
+    if (frame->magic != FRAME_MAGIC) return 0;
+    if (planeIndex < 0 || planeIndex >= (int32_t)frame->numPlanes) return 0;
+    return frame->pixelStrides[planeIndex];
+#else
+    // BGRA is interleaved (4 bytes/pixel); planar buffers are tightly packed.
+    CVPixelBufferRef pixelBuffer = (CVPixelBufferRef)handle;
+    return CVPixelBufferIsPlanar(pixelBuffer) ? 1 : 4;
+#endif
+}
+
 FFI_PLUGIN_EXPORT int32_t Frame_getPlanesCount(FrameHandle handle) {
     if (handle == NULL) return 0;
 #ifdef ANDROID

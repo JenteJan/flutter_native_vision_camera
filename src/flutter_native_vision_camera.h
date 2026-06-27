@@ -56,6 +56,8 @@ extern "C"
     } VisionCameraPlugin;
 
     FFI_PLUGIN_EXPORT int32_t Frame_getBytesPerRow(FrameHandle handle);
+    FFI_PLUGIN_EXPORT int32_t Frame_getPlaneBytesPerRow(FrameHandle handle, int32_t planeIndex);
+    FFI_PLUGIN_EXPORT int32_t Frame_getPlanePixelStride(FrameHandle handle, int32_t planeIndex);
     FFI_PLUGIN_EXPORT int32_t Frame_getPlanesCount(FrameHandle handle);
     FFI_PLUGIN_EXPORT void *Frame_getPlanePointer(FrameHandle handle, int32_t planeIndex);
     FFI_PLUGIN_EXPORT int32_t Frame_getPlaneSize(FrameHandle handle, FrameMetadata metadata, int32_t planeIndex);
