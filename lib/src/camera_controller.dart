@@ -161,10 +161,22 @@ class CameraController extends ValueNotifier<CameraState> {
     if (value == CameraState.disposed) return;
 
     try {
+      // Tear down any frame processor from a previous session before re-init /
+      // device-switch, so frames already queued from the old session don't read
+      // buffers the native side is about to recycle (use-after-free).
+      _frameProcessorPipeline?.stop();
+      _frameProcessorPipeline = null;
+
       _device = device;
       _previewRotationDegrees = null;
       _previewMirrored = false;
       _mirror = mirror;
+      // Reset per-session state so re-init / device-switch starts clean.
+      _isActive = false;
+      _isRecording = false;
+      _textureId = null;
+      _previewWidth = null;
+      _previewHeight = null;
 
       _activeHandler = this;
       _channel.setMethodCallHandler(_handleMethodCall);

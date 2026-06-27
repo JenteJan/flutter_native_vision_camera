@@ -166,6 +166,9 @@ FFI_PLUGIN_EXPORT void Frame_incrementRefCount(FrameHandle handle) {
     if (frame->magic != FRAME_MAGIC) return;
     call_frame_jni(g_retainFrameMethod, frame->id);
 #else
+    // Each reference holds one lock; every decrement unlocks exactly once, so a
+    // retain must take a matching lock or the buffer would be over-unlocked.
+    CVPixelBufferLockBaseAddress((CVPixelBufferRef)handle, kCVPixelBufferLock_ReadOnly);
     CFRetain((CVPixelBufferRef)handle);
 #endif
 }
@@ -181,11 +184,17 @@ FFI_PLUGIN_EXPORT void Frame_decrementRefCount(FrameHandle handle) {
         return;
     }
 
-    call_frame_jni(g_releaseFrameMethod, frame->id);
+    int remaining = call_frame_jni(g_releaseFrameMethod, frame->id);
 
-    // Mark as invalid BEFORE freeing to catch double-frees.
-    frame->magic = 0;
-    free(frame);
+    // Only free the struct once the underlying image is fully released (refcount
+    // reached zero). A Dart-side incrementRefCount()/retain bumps the count, so
+    // the struct (and its plane pointers) must stay valid until the final
+    // decrement — freeing on the first decrement would be a use-after-free.
+    if (remaining <= 0) {
+        // Mark as invalid BEFORE freeing to catch double-frees.
+        frame->magic = 0;
+        free(frame);
+    }
 #else
     CVPixelBufferRef pixelBuffer = (CVPixelBufferRef)handle;
     CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
@@ -194,9 +203,14 @@ FFI_PLUGIN_EXPORT void Frame_decrementRefCount(FrameHandle handle) {
 }
 
 static _Atomic(FrameProcessorCallback) g_frameProcessorCallback = NULL;
+static pthread_mutex_t g_cbMutex = PTHREAD_MUTEX_INITIALIZER;
 
 FFI_PLUGIN_EXPORT void VisionCamera_setFrameProcessorCallback(FrameProcessorCallback callback) {
+    // Serialize with dispatch so detaching the callback (and the Dart-side
+    // NativeCallable.close()) can't race a call that is mid-flight.
+    pthread_mutex_lock(&g_cbMutex);
     atomic_store(&g_frameProcessorCallback, callback);
+    pthread_mutex_unlock(&g_cbMutex);
 }
 
 FFI_PLUGIN_EXPORT void VisionCamera_dispatchFrame(FrameHandle handle, FrameMetadata metadata) {
@@ -212,11 +226,16 @@ FFI_PLUGIN_EXPORT void VisionCamera_dispatchFrame(FrameHandle handle, FrameMetad
     }
 
     // 2. Notify Dart (FFI dispatch). Dart is then responsible for calling
-    //    Frame_decrementRefCount exactly once.
+    //    Frame_decrementRefCount exactly once. Hold the mutex across the
+    //    load+call so teardown can't close the callable mid-dispatch.
+    pthread_mutex_lock(&g_cbMutex);
     FrameProcessorCallback cb = atomic_load(&g_frameProcessorCallback);
     if (cb != NULL) {
         cb(handle, metadata);
-    } else {
+    }
+    pthread_mutex_unlock(&g_cbMutex);
+
+    if (cb == NULL) {
         // No Dart listener; release the reference taken by the native side.
         Frame_decrementRefCount(handle);
     }

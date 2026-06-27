@@ -129,9 +129,10 @@ class CameraPreview extends StatelessWidget {
                     .clamp(0.0, 1.0);
                 final ndy = ((details.localPosition.dy - dy0) / dest.height)
                     .clamp(0.0, 1.0);
-                controller.focus(
-                  _displayToSensor(ndx, ndy, turns, _wantsMirrorLike),
-                );
+                // Invert the *actual* rendered transform (rotation + the flip we
+                // applied), not the desired mirror-like state, so the focus
+                // point matches what the user sees.
+                controller.focus(_displayToSensor(ndx, ndy, turns, flip));
               },
               child: output,
             );
