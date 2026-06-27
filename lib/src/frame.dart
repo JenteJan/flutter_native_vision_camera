@@ -62,6 +62,55 @@ class Frame {
     required this.timestamp,
   });
 
+  /// Builds a [Frame] from a native handle + metadata struct, mapping the raw
+  /// platform format/orientation codes to the Dart enums. Shared by the
+  /// main-isolate pipeline and the worklet runtime.
+  factory Frame.fromNative(Pointer<Void> handle, FrameMetadataNative metadata) {
+    return Frame(
+      handle,
+      width: metadata.width,
+      height: metadata.height,
+      pixelFormat: _mapPixelFormat(metadata.pixelFormat),
+      orientation: _mapOrientation(metadata.orientation),
+      timestamp: metadata.timestamp,
+    );
+  }
+
+  static PixelFormat _mapPixelFormat(int nativeFormat) {
+    switch (nativeFormat) {
+      case 35: // android.graphics.ImageFormat.YUV_420_888
+      case 842094169: // android.graphics.ImageFormat.YV12
+        return PixelFormat.yuv;
+      case 1: // BGRA (iOS) / RGB family
+      case 22: // android.graphics.ImageFormat.RGBA_8888
+        return PixelFormat.rgb;
+      default:
+        if (nativeFormat >= 0 && nativeFormat < PixelFormat.values.length) {
+          return PixelFormat.values[nativeFormat];
+        }
+        return PixelFormat.unknown;
+    }
+  }
+
+  static Orientation _mapOrientation(int nativeOrientation) {
+    switch (nativeOrientation) {
+      case 0:
+        return Orientation.portrait;
+      case 90:
+        return Orientation.landscapeLeft;
+      case 180:
+        return Orientation.portraitUpsideDown;
+      case 270:
+        return Orientation.landscapeRight;
+      default:
+        if (nativeOrientation >= 0 &&
+            nativeOrientation < Orientation.values.length) {
+          return Orientation.values[nativeOrientation];
+        }
+        return Orientation.portrait;
+    }
+  }
+
   /// The number of bytes in each row of the frame's image data.
   int get bytesPerRow => _getBytesPerRow(_pointer);
 

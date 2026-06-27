@@ -1,7 +1,7 @@
 // The Android Gradle Plugin builds the native code with the Android NDK.
 
 group = "dev.jentejan.flutter_native_vision_camera"
-version = "0.0.6"
+version = "0.1.0"
 
 buildscript {
     repositories {

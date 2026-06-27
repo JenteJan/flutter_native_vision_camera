@@ -190,13 +190,16 @@ Run code for every camera frame — the package's headline feature.
 
 ### Threading model — read this
 
-- **Dart frame callback:** delivered **asynchronously on the main isolate's
-  event loop** (via `dart:ffi` `NativeCallable.listener`). It does **not** run
-  on a background isolate and does **not** block the camera thread. Keep the work
-  light, or copy data out and hand it to your own isolate. (A true off-isolate
-  worklet model is on the roadmap.)
-- **Native C/C++ hook:** runs **synchronously on the camera thread** with zero
-  added latency — use this for the heaviest work.
+Three options, lightest to heaviest:
+
+- **`setFrameProcessor`** — a closure delivered **asynchronously on the main
+  isolate** (via `dart:ffi` `NativeCallable.listener`). Easiest; keep the work
+  light (FPS, brightness) or it competes with your UI.
+- **`setFrameWorklet`** — a top-level function that runs on a **background
+  isolate** for heavy work (ML/CV), with the main thread untouched. Results
+  stream back via `frameResults`. See [below](#off-isolate-worklet-heavy-mlcv).
+- **Native C/C++ hook** — runs **synchronously on the camera thread** with zero
+  added latency, for the very heaviest work.
 
 ```dart
 await controller.setFrameProcessor((frame) {
@@ -211,6 +214,40 @@ await controller.setFrameProcessor((frame) {
 > `planeBytesPerRow(i)` / `planePixelStride(i)` to walk it correctly (rows are
 > padded). `computeLuminance` is **YUV/Android-only** — on iOS (BGRA) it returns
 > `0.0`; read `getPlaneData(0)` instead.
+
+### Off-isolate worklet (heavy ML/CV)
+
+For heavy per-frame work, run it on a **background isolate** so the UI never
+janks. The entry is a **top-level/static function** (Dart can't ship a closure
+across isolates). Pass model bytes via `args` — a worker isolate can't read
+`rootBundle`, so load assets on the main isolate. Register `onFrame`, and `send`
+results back:
+
+```dart
+// Top-level — runs on the worker isolate.
+void detectorWorklet(FrameWorklet w) {
+  final args = w.args as ({Uint8List model, String labels});
+  final interpreter = Interpreter.fromBuffer(args.model); // tflite_flutter
+  w.onFrame((frame) {
+    final boxes = runModel(interpreter, frame); // heavy inference, off-main
+    w.send(boxes);                              // sendable result → main
+  });
+}
+
+// Main isolate:
+final model =
+    (await rootBundle.load('assets/model.tflite')).buffer.asUint8List();
+final labels = await rootBundle.loadString('assets/labels.txt');
+controller.frameResults.listen((r) => setState(() => _boxes = r as List));
+await controller.setFrameWorklet(
+  detectorWorklet,
+  args: (model: model, labels: labels),
+);
+```
+
+Frames cross to the worker as the **same zero-copy FFI pointers** (no buffer
+copy). Map detection boxes onto the preview with `previewRectFromFrame`. The
+example's **Object Detector** is a full EfficientDet-Lite0 worklet.
 
 ### Keeping a frame past the callback
 
@@ -283,6 +320,7 @@ working example.
 | Video recording (+ audio) | ✅ CameraX | ✅ AVAssetWriter |
 | Barcode / QR scanning | ✅ MLKit | ✅ Vision |
 | Frame processor (Dart, main isolate) | ✅ YUV planes | ✅ BGRA |
+| Frame worklet (Dart, background isolate) | ✅ | ✅ |
 | Native C/C++ plugin (camera thread) | ✅ | ✅ |
 | Zoom / torch / exposure / tap-focus | ✅ | ✅ |
 | Manual focus distance | ⬜ | ✅ |
@@ -296,8 +334,9 @@ between MLKit (Android) and Vision (iOS).
 ## Limitations & Roadmap
 
 - **No web / desktop** — Android + iOS only.
-- **Frame processor runs on the main isolate** today; a true off-isolate worklet
-  model is planned.
+- **Off-isolate worklets** (`setFrameWorklet`) run heavy work on a background
+  isolate; the simpler `setFrameProcessor` stays main-isolate by design (light
+  work). Worklet entries must be top-level functions (a Dart isolate constraint).
 - **Recording options** (`RecordVideoOptions`, codec/HDR) and **pause/resume**
   are not yet wired on all platforms; `startRecording` takes a path string.
 - **Mirror** is set at `initialize` time (no runtime toggle yet).

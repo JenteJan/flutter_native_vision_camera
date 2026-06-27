@@ -4,7 +4,7 @@
 #
 Pod::Spec.new do |s|
   s.name             = 'flutter_native_vision_camera'
-  s.version          = '0.0.6'
+  s.version          = '0.1.0'
   s.summary          = 'High-performance Flutter FFI camera plugin with zero-copy preview and real-time frame access.'
   s.description      = <<-DESC
 A high-performance camera plugin for Flutter built on AVFoundation (iOS) and CameraX (Android),

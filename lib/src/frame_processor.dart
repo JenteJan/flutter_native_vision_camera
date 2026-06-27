@@ -4,8 +4,6 @@ import 'dart:ffi';
 import 'package:flutter/foundation.dart';
 
 import 'frame.dart';
-import 'types/orientation.dart';
-import 'types/pixel_format.dart';
 
 /// The signature of a frame processor callback.
 ///
@@ -52,14 +50,7 @@ class FrameProcessorPipeline {
   /// pipeline was stopped between dispatch and delivery, or the user callback
   /// throws.
   void _onNativeFrame(Pointer<Void> handle, FrameMetadataNative metadata) {
-    final frame = Frame(
-      handle,
-      width: metadata.width,
-      height: metadata.height,
-      pixelFormat: _mapPixelFormat(metadata.pixelFormat),
-      orientation: _mapOrientation(metadata.orientation),
-      timestamp: metadata.timestamp,
-    );
+    final frame = Frame.fromNative(handle, metadata);
     try {
       if (!_stopped) callback(frame);
     } catch (e, stack) {
@@ -81,41 +72,6 @@ class FrameProcessorPipeline {
     setNativeFrameProcessorCallback(nullptr);
     _nativeCallable?.close();
     _nativeCallable = null;
-  }
-
-  static PixelFormat _mapPixelFormat(int nativeFormat) {
-    switch (nativeFormat) {
-      case 35: // android.graphics.ImageFormat.YUV_420_888
-      case 842094169: // android.graphics.ImageFormat.YV12
-        return PixelFormat.yuv;
-      case 1: // BGRA (iOS) / RGB family
-      case 22: // android.graphics.ImageFormat.RGBA_8888
-        return PixelFormat.rgb;
-      default:
-        if (nativeFormat >= 0 && nativeFormat < PixelFormat.values.length) {
-          return PixelFormat.values[nativeFormat];
-        }
-        return PixelFormat.unknown;
-    }
-  }
-
-  static Orientation _mapOrientation(int nativeOrientation) {
-    switch (nativeOrientation) {
-      case 0:
-        return Orientation.portrait;
-      case 90:
-        return Orientation.landscapeLeft;
-      case 180:
-        return Orientation.portraitUpsideDown;
-      case 270:
-        return Orientation.landscapeRight;
-      default:
-        if (nativeOrientation >= 0 &&
-            nativeOrientation < Orientation.values.length) {
-          return Orientation.values[nativeOrientation];
-        }
-        return Orientation.portrait;
-    }
   }
 }
 
