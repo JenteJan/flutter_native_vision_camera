@@ -810,13 +810,18 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
                     is VideoRecordEvent.Finalize -> {
                         if (event.hasError()) {
                             Log.e("CameraPlugin", "Video recording error: ${event.error}")
-                            // Surface the failure to whichever call is still pending:
-                            // the start() future if it errored before Start, otherwise
-                            // the stop() future.
+                            // Drop the dangling recording so a later stopRecording()
+                            // doesn't hang, and surface the failure to whichever call
+                            // is still pending plus the controller's error stream.
+                            activeRecording = null
                             mainHandler.post {
                                 safeResult.error("RECORDING_ERROR", "Recording failed (code ${event.error})", null)
                                 pendingVideoResult?.error("RECORDING_ERROR", "Recording failed (code ${event.error})", null)
                                 pendingVideoResult = null
+                                channel.invokeMethod("onError", mapOf(
+                                    "code" to "RECORDING_ERROR",
+                                    "message" to "Recording failed (code ${event.error})"
+                                ))
                             }
                             return@start
                         }
@@ -1044,6 +1049,10 @@ class FlutterNativeVisionCameraPlugin : FlutterPlugin, MethodCallHandler, Activi
         }
         val act = activity ?: run {
             result.error("NO_ACTIVITY", "Activity not available", null)
+            return
+        }
+        if (pendingMicPermissionResult != null) {
+            result.error("PERMISSION_REQUEST_IN_PROGRESS", "A microphone permission request is already in progress", null)
             return
         }
         pendingMicPermissionResult = result
