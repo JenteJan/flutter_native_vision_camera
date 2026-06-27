@@ -1,47 +1,27 @@
 PODS:
-  - camera_avfoundation (0.0.1):
-    - Flutter
   - Flutter (1.0.0)
-  - flutter_native_vision_camera (0.0.1):
+  - flutter_native_vision_camera (0.0.4):
     - Flutter
-  - path_provider_foundation (0.0.1):
-    - Flutter
-    - FlutterMacOS
   - permission_handler_apple (9.3.0):
     - Flutter
-  - video_player_avfoundation (0.0.1):
-    - Flutter
-    - FlutterMacOS
 
 DEPENDENCIES:
-  - camera_avfoundation (from `.symlinks/plugins/camera_avfoundation/ios`)
   - Flutter (from `Flutter`)
   - flutter_native_vision_camera (from `.symlinks/plugins/flutter_native_vision_camera/ios`)
-  - path_provider_foundation (from `.symlinks/plugins/path_provider_foundation/darwin`)
   - permission_handler_apple (from `.symlinks/plugins/permission_handler_apple/ios`)
-  - video_player_avfoundation (from `.symlinks/plugins/video_player_avfoundation/darwin`)
 
 EXTERNAL SOURCES:
-  camera_avfoundation:
-    :path: ".symlinks/plugins/camera_avfoundation/ios"
   Flutter:
     :path: Flutter
   flutter_native_vision_camera:
     :path: ".symlinks/plugins/flutter_native_vision_camera/ios"
-  path_provider_foundation:
-    :path: ".symlinks/plugins/path_provider_foundation/darwin"
   permission_handler_apple:
     :path: ".symlinks/plugins/permission_handler_apple/ios"
-  video_player_avfoundation:
-    :path: ".symlinks/plugins/video_player_avfoundation/darwin"
 
 SPEC CHECKSUMS:
-  camera_avfoundation: be3be85408cd4126f250386828e9b1dfa40ab436
   Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
-  flutter_native_vision_camera: d74a45725a896808ff8569d5d756a1e9589e1310
-  path_provider_foundation: 080d55be775b7414fd5a5ef3ac137b97b097e564
+  flutter_native_vision_camera: f9cae7b27180d93bf6fafad999e37e5086ae477a
   permission_handler_apple: 4ed2196e43d0651e8ff7ca3483a069d469701f2d
-  video_player_avfoundation: 2cef49524dd1f16c5300b9cd6efd9611ce03639b
 
 PODFILE CHECKSUM: 3c63482e143d1b91d2d2560aee9fb04ecc74ac7e
 

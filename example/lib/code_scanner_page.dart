@@ -129,30 +129,19 @@ class _CodeScannerPageState extends State<CodeScannerPage>
           // High-Tech Viewfinder
           const Center(child: ViewfinderGuide()),
 
-          // Overlay Boxes
+          // Overlay Boxes — sized against the controller's upright display
+          // size (single source of truth), so boxes stay aligned with the
+          // rotation CameraPreview already applies. No manual W/H swap.
           if (_isInitialized)
             Positioned.fill(
               child: Builder(
                 builder: (context) {
-                  final orientation =
-                      _controller.device?.sensorOrientation ??
-                      Orientation.portrait;
-                  final bool isSwapped =
-                      orientation == Orientation.landscapeLeft ||
-                      orientation == Orientation.landscapeRight;
-
-                  final previewWidth = isSwapped
-                      ? (_controller.previewHeight?.toDouble() ?? 1080)
-                      : (_controller.previewWidth?.toDouble() ?? 1920);
-                  final previewHeight = isSwapped
-                      ? (_controller.previewWidth?.toDouble() ?? 1920)
-                      : (_controller.previewHeight?.toDouble() ?? 1080);
-
+                  final display = _controller.displayPreviewSize;
                   return CustomPaint(
                     painter: ScannerOverlayPainter(
                       _scannedCodes,
-                      previewWidth,
-                      previewHeight,
+                      display?.width ?? 1080,
+                      display?.height ?? 1920,
                     ),
                   );
                 },
@@ -323,7 +312,7 @@ class ScannerOverlayPainter extends CustomPainter {
       ..strokeWidth = 3.0;
 
     final fillPaint = Paint()
-      ..color = Colors.greenAccent.withOpacity(0.2)
+      ..color = Colors.greenAccent.withValues(alpha: 0.2)
       ..style = PaintingStyle.fill;
 
     // Calculate BoxFit.cover mapping

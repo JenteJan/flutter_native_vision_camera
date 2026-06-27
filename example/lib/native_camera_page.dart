@@ -116,6 +116,9 @@ class _NativeCameraPageState extends State<NativeCameraPage>
         format: _currentFormat,
         enablePhoto: true,
         enableVideo: true,
+        // One flag drives BOTH the preview and the saved image: true = selfie
+        // mirror, false = save what the camera actually sees.
+        mirror: true,
       );
 
       // Start FPS counter via frame processor
@@ -247,18 +250,15 @@ class _NativeCameraPageState extends State<NativeCameraPage>
           body: Stack(
             children: [
               if (_isInitialized)
+                // CameraPreview self-orients via controller.previewRotation —
+                // no AspectRatio/RotatedBox compensation needed here.
                 Positioned.fill(
-                  child: Center(
-                    child: AspectRatio(
-                      aspectRatio:
-                          (_currentFormat?.videoHeight ?? 1) /
-                          (_currentFormat?.videoWidth ?? 1),
-                      child: CameraPreview(
-                        controller: _controller,
-                        resizeMode: ResizeMode.cover,
-                        onTapToFocus: true,
-                      ),
-                    ),
+                  child: CameraPreview(
+                    controller: _controller,
+                    // Fit the whole frame inside the view (letterboxed) so the
+                    // full image is visible instead of cropped to fill.
+                    resizeMode: ResizeMode.contain,
+                    onTapToFocus: true,
                   ),
                 )
               else
