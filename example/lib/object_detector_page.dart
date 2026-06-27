@@ -6,20 +6,14 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter_native_vision_camera/flutter_native_vision_camera.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 
-/// A real-time multi-class object detector built on the package's FFI frame
-/// pipeline.
+/// A real-time multi-class object detector that runs entirely **off the main
+/// isolate** via the package's frame-worklet API.
 ///
-/// Pipeline: [CameraController.setFrameProcessor] delivers each frame → we read
-/// the raw YUV/BGRA buffers over FFI and resize+rotate them into the model's
-/// input tensor → an **EfficientDet-Lite0** detector (90 COCO classes) runs in a
-/// background isolate → we draw a labelled box for every object.
-///
-/// On top of the general detection it keeps a **single-class certainty trigger**
-/// for "cat": temporal voting turns the jittery per-frame score into a stable
-/// "certain" verdict — the technique you'd use for a reliable real-time alert.
-///
-/// The frame pipeline is generic, so swapping EfficientDet for your own
-/// `.tflite` is a one-line change — that's the whole point of the FFI access.
+/// The heavy work — YUV→RGB preprocessing and EfficientDet-Lite0 inference (90
+/// COCO classes) — happens in [objectDetectorWorklet] on a worker isolate. It
+/// `send`s plain detection data back; the UI isolate only maps boxes into
+/// preview space (cheap) and paints. The main thread never touches a frame, so
+/// the preview and UI stay smooth no matter how heavy the model is.
 class ObjectDetectorPage extends StatefulWidget {
   const ObjectDetectorPage({super.key});
 
@@ -30,43 +24,39 @@ class ObjectDetectorPage extends StatefulWidget {
 class _ObjectDetectorPageState extends State<ObjectDetectorPage>
     with WidgetsBindingObserver {
   final CameraController _controller = CameraController();
-  final FrameProcessorThrottler _throttler = FrameProcessorThrottler(
-    targetFps: 5,
-  );
 
-  Interpreter? _interpreter;
-  IsolateInterpreter? _isolate;
-  List<String> _labels = [];
-  int _inputSize = 320;
-  List<List<int>> _outShapes = [];
-
-  static const double _displayGate = 0.40; // min score to draw a box
-  // Temporal voting for the "cat" trigger.
+  // Cat-certainty voting (lives on the UI isolate — it's trivial).
   final List<double> _catWindow = [];
   static const int _windowSize = 8;
   static const int _needHits = 4;
+  static const double _gate = 0.40;
 
-  bool _isInitialized = false;
-  bool _busy = false;
-  int _lastFrameDeg = -1; // diagnostics: log rotation only when it changes
   List<_Obj> _objects = [];
   double _catScore = 0;
   bool _catCertain = false;
+  bool _isInitialized = false;
   String? _error;
+  int _uiTicks = 0; // proves the main isolate stays free
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _init();
+    _spin();
+  }
+
+  Future<void> _spin() async {
+    while (mounted) {
+      await Future.delayed(const Duration(milliseconds: 16));
+      if (mounted) setState(() => _uiTicks++);
+    }
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _controller.dispose();
-    _isolate?.close();
-    _interpreter?.close();
     super.dispose();
   }
 
@@ -88,8 +78,6 @@ class _ObjectDetectorPageState extends State<ObjectDetectorPage>
         setState(() => _error = 'Camera permission denied.');
         return;
       }
-      await _loadModel();
-
       final devices = await CameraDevices.getAvailableCameraDevices();
       if (devices.isEmpty) {
         setState(() => _error = 'No camera found.');
@@ -100,7 +88,17 @@ class _ObjectDetectorPageState extends State<ObjectDetectorPage>
           devices.first;
 
       await _controller.initialize(device, pixelFormat: PixelFormat.yuv);
-      await _controller.setFrameProcessor(_onFrame);
+      _controller.frameResults.listen(_onResult);
+      // A worker isolate can't read rootBundle, so load the model + labels on
+      // the main isolate and hand them to the worklet via `args`.
+      final model = (await rootBundle.load(
+        'assets/efficientdet.tflite',
+      )).buffer.asUint8List();
+      final labels = await rootBundle.loadString('assets/coco_labels.txt');
+      await _controller.setFrameWorklet(
+        objectDetectorWorklet,
+        args: (model: model, labels: labels),
+      );
       await _controller.setActive(true);
       setState(() => _isInitialized = true);
     } catch (e) {
@@ -108,224 +106,29 @@ class _ObjectDetectorPageState extends State<ObjectDetectorPage>
     }
   }
 
-  Future<void> _loadModel() async {
-    final interpreter = await Interpreter.fromAsset(
-      'assets/efficientdet.tflite',
-    );
-    _interpreter = interpreter;
-    _isolate = await IsolateInterpreter.create(address: interpreter.address);
-
-    _inputSize = interpreter.getInputTensor(0).shape[1];
-    _outShapes = interpreter
-        .getOutputTensors()
-        .map((t) => t.shape)
-        .toList(growable: false);
-
-    final raw = await rootBundle.loadString('assets/coco_labels.txt');
-    _labels = raw
-        .split('\n')
-        .map((e) => e.trim())
-        .where((e) => e.isNotEmpty)
-        .toList();
-
-    debugPrint(
-      'ObjectDetector: input=${interpreter.getInputTensor(0).shape}, '
-      'outputs=$_outShapes, labels=${_labels.length}',
-    );
-  }
-
-  void _onFrame(Frame frame) {
-    if (_isolate == null) return;
-    if (!_throttler.shouldProcess((frame.timestamp * 1000).toInt())) return;
-    if (_busy) return;
-    _busy = true;
-
-    // DIAGNOSTIC: how do the frame's orientation and the preview's rotation
-    // relate as the phone turns? (Logged only when the frame orientation flips.)
-    final fdeg = _degreesOf(frame.orientation);
-    if (fdeg != _lastFrameDeg) {
-      _lastFrameDeg = fdeg;
-      debugPrint(
-        'ObjRot: frame.orientation=$fdeg° previewQuarterTurns='
-        '${_controller.previewRotation} mirrored=${_controller.previewMirrored} '
-        'displaySize=${_controller.displayPreviewSize}',
+  // Runs on the UI isolate: map the worker's frame-space boxes into preview
+  // space and update the overlay. This is the only per-frame main-isolate work.
+  void _onResult(Object? msg) {
+    if (msg is! _DetResult || !mounted) return;
+    final objs = <_Obj>[];
+    var catScore = 0.0;
+    for (final d in msg.dets) {
+      final box = _controller.previewRectFromFrame(
+        Rect.fromLTRB(d.xmin, d.ymin, d.xmax, d.ymax),
+        sourceRotationDegrees: msg.rotation,
       );
+      final isCat = d.label == 'cat';
+      objs.add(_Obj(box, d.label, d.score, isCat));
+      if (isCat && d.score > catScore) catScore = d.score;
     }
-
-    // Read+resize+rotate the frame into the model input NOW (the FFI buffer is
-    // only valid inside this callback).
-    final Uint8List input;
-    try {
-      input = _frameToRgb(frame, _inputSize, fdeg);
-    } catch (_) {
-      _busy = false;
-      return;
-    }
-
-    _detect(input, fdeg).then(_apply).whenComplete(() => _busy = false);
-  }
-
-  Future<_Detection> _detect(Uint8List rgb, int frameDeg) async {
-    try {
-      final s = _inputSize;
-      final inputs = [rgb.reshape([1, s, s, 3])];
-      final outputs = <int, Object>{
-        for (var i = 0; i < _outShapes.length; i++) i: _alloc(_outShapes[i]),
-      };
-      await _isolate!.runForMultipleInputs(inputs, outputs);
-
-      // EfficientDet's 4 outputs come back in a converter-dependent order, so
-      // classify them by shape (and value range) instead of assuming.
-      List<List<double>>? boxes; // [N][4]  ymin,xmin,ymax,xmax
-      final twoDim = <List<double>>[]; // candidate scores/classes
-      for (var i = 0; i < _outShapes.length; i++) {
-        final shape = _outShapes[i];
-        if (shape.length == 3 && shape.last == 4) {
-          boxes = _flatten2(outputs[i]);
-        } else if (shape.length == 2) {
-          twoDim.add(_flatten1(outputs[i]));
-        }
-      }
-      if (boxes == null || twoDim.length < 2) return const _Detection(0, []);
-
-      // Of the two [1,N] tensors, classes holds indices (0..89) → larger max;
-      // scores are probabilities in [0,1].
-      twoDim.sort((a, b) => _max(b).compareTo(_max(a)));
-      final classes = twoDim[0];
-      final scores = twoDim[1];
-
-      var catScore = 0.0;
-      final objs = <_Obj>[];
-      for (var j = 0; j < scores.length; j++) {
-        if (scores[j] < _displayGate) continue;
-        final ci = classes[j].round();
-        if (ci < 0 || ci >= _labels.length) continue;
-        final label = _labels[ci];
-        if (label == '???') continue; // COCO index gaps
-        final b = boxes[j]; // ymin, xmin, ymax, xmax (in the upright frame)
-        final isCat = label == 'cat';
-        // Map the box into preview-display space with the package helper so it
-        // tracks the preview at any device orientation.
-        final box = _controller.previewRectFromFrame(
-          Rect.fromLTRB(b[1], b[0], b[3], b[2]),
-          sourceRotationDegrees: frameDeg,
-        );
-        objs.add(_Obj(box, label, scores[j], isCat));
-        if (isCat && scores[j] > catScore) catScore = scores[j];
-      }
-      return _Detection(catScore, objs);
-    } catch (e) {
-      debugPrint('ObjectDetector inference error: $e');
-      return const _Detection(0, []);
-    }
-  }
-
-  void _apply(_Detection d) {
-    if (!mounted) return;
-    _catWindow.add(d.catScore);
+    _catWindow.add(catScore);
     if (_catWindow.length > _windowSize) _catWindow.removeAt(0);
-    final hits = _catWindow.where((s) => s >= _displayGate).length;
+    final hits = _catWindow.where((s) => s >= _gate).length;
     setState(() {
-      _objects = d.objects;
-      _catScore = d.catScore;
+      _objects = objs;
+      _catScore = catScore;
       _catCertain = _catWindow.length >= _windowSize && hits >= _needHits;
     });
-  }
-
-  /// Samples the YUV_420_888 frame into a packed RGB `uint8` buffer of
-  /// [size]x[size], applying [rotationDegrees] so the model sees an upright
-  /// image. Stride-correct (honours row/pixel strides) — the reason the package
-  /// exposes [Frame.planeBytesPerRow] / [Frame.planePixelStride].
-  Uint8List _frameToRgb(Frame frame, int size, int rotationDegrees) {
-    final fw = frame.width, fh = frame.height;
-    final y = frame.getPlaneData(0);
-    final u = frame.getPlaneData(1);
-    final v = frame.getPlaneData(2);
-    final yRow = frame.planeBytesPerRow(0);
-    final uRow = frame.planeBytesPerRow(1);
-    final vRow = frame.planeBytesPerRow(2);
-    final uPix = frame.planePixelStride(1);
-    final vPix = frame.planePixelStride(2);
-
-    final out = Uint8List(size * size * 3);
-    var o = 0;
-    for (var oy = 0; oy < size; oy++) {
-      final tv = (oy + 0.5) / size; // normalized in upright image
-      for (var ox = 0; ox < size; ox++) {
-        final tu = (ox + 0.5) / size;
-        // Map upright (tu,tv) back to the sensor-oriented frame.
-        final double nu, nv;
-        switch (rotationDegrees) {
-          case 90:
-            nu = tv;
-            nv = 1 - tu;
-            break;
-          case 180:
-            nu = 1 - tu;
-            nv = 1 - tv;
-            break;
-          case 270:
-            nu = 1 - tv;
-            nv = tu;
-            break;
-          default:
-            nu = tu;
-            nv = tv;
-        }
-        var fx = (nu * fw).toInt();
-        var fy = (nv * fh).toInt();
-        if (fx < 0) fx = 0;
-        if (fx >= fw) fx = fw - 1;
-        if (fy < 0) fy = 0;
-        if (fy >= fh) fy = fh - 1;
-
-        final yy = y[fy * yRow + fx];
-        final cx = fx >> 1, cy = fy >> 1;
-        final uu = u[cy * uRow + cx * uPix] - 128;
-        final vv = v[cy * vRow + cx * vPix] - 128;
-
-        out[o++] = _clip(yy + ((1436 * vv) >> 10)); // R
-        out[o++] = _clip(yy - ((352 * uu + 731 * vv) >> 10)); // G
-        out[o++] = _clip(yy + ((1814 * uu) >> 10)); // B
-      }
-    }
-    return out;
-  }
-
-  static int _clip(int v) => v < 0 ? 0 : (v > 255 ? 255 : v);
-
-  static int _degreesOf(Orientation o) {
-    switch (o) {
-      case Orientation.landscapeLeft:
-        return 90;
-      case Orientation.portraitUpsideDown:
-        return 180;
-      case Orientation.landscapeRight:
-        return 270;
-      case Orientation.portrait:
-        return 0;
-    }
-  }
-
-  // Output-buffer helpers.
-  static Object _alloc(List<int> shape) {
-    if (shape.length == 1) return List<double>.filled(shape[0], 0);
-    return List.generate(shape[0], (_) => _alloc(shape.sublist(1)));
-  }
-
-  static List<double> _flatten1(Object? o) =>
-      ((o as List)[0] as List).cast<num>().map((e) => e.toDouble()).toList();
-
-  static List<List<double>> _flatten2(Object? o) => ((o as List)[0] as List)
-      .map((r) => (r as List).cast<num>().map((e) => e.toDouble()).toList())
-      .toList();
-
-  static double _max(List<double> l) {
-    var m = double.negativeInfinity;
-    for (final v in l) {
-      if (v > m) m = v;
-    }
-    return m;
   }
 
   @override
@@ -435,7 +238,7 @@ class _ObjectDetectorPageState extends State<ObjectDetectorPage>
                     minHeight: 8,
                     backgroundColor: Colors.white24,
                     valueColor: AlwaysStoppedAnimation(
-                      _catScore >= _displayGate
+                      _catScore >= _gate
                           ? Colors.greenAccent
                           : Colors.amberAccent,
                     ),
@@ -453,9 +256,9 @@ class _ObjectDetectorPageState extends State<ObjectDetectorPage>
             ],
           ),
           const SizedBox(height: 6),
-          const Text(
-            'EfficientDet-Lite0 · 90 COCO classes · cat-certainty by voting',
-            style: TextStyle(color: Colors.white70, fontSize: 11),
+          Text(
+            'EfficientDet-Lite0 off-isolate · UI ticks $_uiTicks (smooth ⇒ main free)',
+            style: const TextStyle(color: Colors.white70, fontSize: 11),
           ),
         ],
       ),
@@ -463,26 +266,191 @@ class _ObjectDetectorPageState extends State<ObjectDetectorPage>
   }
 }
 
-/// One frame's detections.
-class _Detection {
-  final double catScore; // best cat score this frame (drives the cat trigger)
-  final List<_Obj> objects;
-  const _Detection(this.catScore, this.objects);
+// ---------------------------------------------------------------------------
+// Worklet — everything below runs on the WORKER isolate (top-level only).
+// ---------------------------------------------------------------------------
+
+typedef _Det = ({
+  String label,
+  double score,
+  double ymin,
+  double xmin,
+  double ymax,
+  double xmax,
+});
+typedef _DetResult = ({int rotation, List<_Det> dets});
+
+/// Frame worklet: loads EfficientDet-Lite0 once, then runs YUV→RGB + inference
+/// per frame on the worker isolate and sends back frame-space detections.
+void objectDetectorWorklet(FrameWorklet w) {
+  final args = w.args as ({Uint8List model, String labels});
+  final interpreter = Interpreter.fromBuffer(args.model);
+  final inputSize = interpreter.getInputTensor(0).shape[1];
+  final outShapes = interpreter
+      .getOutputTensors()
+      .map((t) => t.shape)
+      .toList(growable: false);
+  final labels = args.labels
+      .split('\n')
+      .map((e) => e.trim())
+      .where((e) => e.isNotEmpty)
+      .toList();
+  final throttler = FrameProcessorThrottler(targetFps: 8);
+
+  w.onFrame((frame) {
+    if (!throttler.shouldProcess((frame.timestamp * 1000).toInt())) return;
+    final rotation = frame.orientation.degrees;
+    final rgb = _frameToRgb(frame, inputSize, rotation);
+    final dets = _runDetection(interpreter, outShapes, labels, rgb, inputSize);
+    w.send((rotation: rotation, dets: dets));
+  });
 }
 
+List<_Det> _runDetection(
+  Interpreter interpreter,
+  List<List<int>> outShapes,
+  List<String> labels,
+  Uint8List rgb,
+  int size,
+) {
+  final inputs = [
+    rgb.reshape([1, size, size, 3]),
+  ];
+  final outputs = <int, Object>{
+    for (var i = 0; i < outShapes.length; i++) i: _alloc(outShapes[i]),
+  };
+  interpreter.runForMultipleInputs(inputs, outputs);
+
+  List<List<double>>? boxes; // [N][4] ymin,xmin,ymax,xmax
+  final twoDim = <List<double>>[];
+  for (var i = 0; i < outShapes.length; i++) {
+    final shape = outShapes[i];
+    if (shape.length == 3 && shape.last == 4) {
+      boxes = _flatten2(outputs[i]);
+    } else if (shape.length == 2) {
+      twoDim.add(_flatten1(outputs[i]));
+    }
+  }
+  if (boxes == null || twoDim.length < 2) return const [];
+
+  // Of the two [1,N] tensors, classes holds indices (larger max); scores [0,1].
+  twoDim.sort((a, b) => _max(b).compareTo(_max(a)));
+  final classes = twoDim[0], scores = twoDim[1];
+
+  final dets = <_Det>[];
+  for (var j = 0; j < scores.length; j++) {
+    if (scores[j] < 0.40) continue;
+    final ci = classes[j].round();
+    if (ci < 0 || ci >= labels.length) continue;
+    final label = labels[ci];
+    if (label == '???') continue;
+    final b = boxes[j];
+    dets.add((
+      label: label,
+      score: scores[j],
+      ymin: b[0],
+      xmin: b[1],
+      ymax: b[2],
+      xmax: b[3],
+    ));
+  }
+  return dets;
+}
+
+/// Samples a YUV_420_888 frame into a packed RGB `uint8` buffer of [size]×[size],
+/// applying [rotationDegrees] (stride-correct — honours row/pixel strides).
+Uint8List _frameToRgb(Frame frame, int size, int rotationDegrees) {
+  final fw = frame.width, fh = frame.height;
+  final y = frame.getPlaneData(0);
+  final u = frame.getPlaneData(1);
+  final v = frame.getPlaneData(2);
+  final yRow = frame.planeBytesPerRow(0);
+  final uRow = frame.planeBytesPerRow(1);
+  final vRow = frame.planeBytesPerRow(2);
+  final uPix = frame.planePixelStride(1);
+  final vPix = frame.planePixelStride(2);
+
+  final out = Uint8List(size * size * 3);
+  var o = 0;
+  for (var oy = 0; oy < size; oy++) {
+    final tv = (oy + 0.5) / size;
+    for (var ox = 0; ox < size; ox++) {
+      final tu = (ox + 0.5) / size;
+      final double nu, nv;
+      switch (rotationDegrees) {
+        case 90:
+          nu = tv;
+          nv = 1 - tu;
+          break;
+        case 180:
+          nu = 1 - tu;
+          nv = 1 - tv;
+          break;
+        case 270:
+          nu = 1 - tv;
+          nv = tu;
+          break;
+        default:
+          nu = tu;
+          nv = tv;
+      }
+      var fx = (nu * fw).toInt();
+      var fy = (nv * fh).toInt();
+      if (fx < 0) fx = 0;
+      if (fx >= fw) fx = fw - 1;
+      if (fy < 0) fy = 0;
+      if (fy >= fh) fy = fh - 1;
+
+      final yy = y[fy * yRow + fx];
+      final cx = fx >> 1, cy = fy >> 1;
+      final uu = u[cy * uRow + cx * uPix] - 128;
+      final vv = v[cy * vRow + cx * vPix] - 128;
+
+      out[o++] = _clip(yy + ((1436 * vv) >> 10)); // R
+      out[o++] = _clip(yy - ((352 * uu + 731 * vv) >> 10)); // G
+      out[o++] = _clip(yy + ((1814 * uu) >> 10)); // B
+    }
+  }
+  return out;
+}
+
+int _clip(int v) => v < 0 ? 0 : (v > 255 ? 255 : v);
+
+Object _alloc(List<int> shape) {
+  if (shape.length == 1) return List<double>.filled(shape[0], 0);
+  return List.generate(shape[0], (_) => _alloc(shape.sublist(1)));
+}
+
+List<double> _flatten1(Object? o) =>
+    ((o as List)[0] as List).cast<num>().map((e) => e.toDouble()).toList();
+
+List<List<double>> _flatten2(Object? o) => ((o as List)[0] as List)
+    .map((r) => (r as List).cast<num>().map((e) => e.toDouble()).toList())
+    .toList();
+
+double _max(List<double> l) {
+  var m = double.negativeInfinity;
+  for (final v in l) {
+    if (v > m) m = v;
+  }
+  return m;
+}
+
+// ---------------------------------------------------------------------------
+// UI-isolate types.
+// ---------------------------------------------------------------------------
+
 class _Obj {
-  final Rect box; // normalized 0..1 in the upright image
+  final Rect box; // preview-display space
   final String label;
   final double score;
   final bool isCat;
   const _Obj(this.box, this.label, this.score, this.isCat);
 }
 
-/// Draws each detection, mapping a normalized box in the upright image onto the
-/// `contain`-fitted preview rect. Cats use [catColor]; other objects are cyan.
 class _BoxPainter extends CustomPainter {
   final List<_Obj> objects;
-  final Size? previewSize; // upright preview dimensions
+  final Size? previewSize;
   final Color catColor;
 
   _BoxPainter(this.objects, this.previewSize, this.catColor);
@@ -503,7 +471,6 @@ class _BoxPainter extends CustomPainter {
 
     for (final obj in objects) {
       final color = obj.isCat ? catColor : Colors.cyanAccent;
-      // obj.box is already in preview-display space (see previewRectFromFrame).
       final r = Rect.fromLTRB(
         img.left + obj.box.left * img.width,
         img.top + obj.box.top * img.height,

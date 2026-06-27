@@ -17,6 +17,7 @@ export 'src/camera_permissions.dart';
 export 'src/camera_preview.dart';
 export 'src/frame.dart';
 export 'src/frame_processor.dart';
+export 'src/frame_worklet.dart' show FrameWorklet, FrameWorkletEntry;
 export 'src/types/types.dart';
 export 'src/types/code_scanner.dart';
 

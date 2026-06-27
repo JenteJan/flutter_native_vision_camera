@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.0
+
+* **Off-isolate frame worklets** — the headline feature. `CameraController.setFrameWorklet(entry, args:)`
+  runs heavy per-frame work (ML inference, CV) on a **background isolate**, with the main thread untouched;
+  results stream back via `CameraController.frameResults`. The worklet entry is a top-level function (Dart
+  can't ship closures across isolates) and receives a `FrameWorklet` context (`onFrame`, `send`, `args`).
+  Frames cross to the worker as the same zero-copy FFI pointers. The simpler main-isolate `setFrameProcessor`
+  stays for light work.
+* **Example:** the Object Detector now runs entirely off-isolate — EfficientDet-Lite0 inference on a worker,
+  with a live main-isolate UI-tick counter proving the main thread stays free.
+* **Internal:** shared `Frame.fromNative` factory; race-free cross-isolate worklet teardown.
+
 ## 0.0.6
 
 * **New:** `CameraController.previewRectFromFrame(rect, sourceRotationDegrees:)` maps a normalized

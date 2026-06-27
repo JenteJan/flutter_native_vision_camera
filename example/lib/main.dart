@@ -87,7 +87,7 @@ class _HomePageState extends State<HomePage> {
             _buildFeatureCard(
               context,
               title: 'Object Detector',
-              subtitle: 'Frame processor → EfficientDet (90 classes) + boxes',
+              subtitle: 'Off-isolate worklet → EfficientDet (90 classes)',
               icon: Icons.center_focus_strong,
               color: Colors.deepPurple,
               onTap: () {

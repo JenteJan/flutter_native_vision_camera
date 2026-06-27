@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:isolate';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import '../flutter_native_vision_camera.dart';
+import 'frame_worklet.dart';
 
 /// The method channel used for communication with native platform code.
 const MethodChannel _channel = MethodChannel(
@@ -45,6 +47,13 @@ class CameraController extends ValueNotifier<CameraState> {
 
   CameraDevice? _device;
   FrameProcessorPipeline? _frameProcessorPipeline;
+
+  // Off-isolate frame worklet state.
+  Isolate? _workletIsolate;
+  SendPort? _workletControl;
+  ReceivePort? _workletReceive;
+  Completer<void>? _workletStopped;
+  StreamController<Object?>? _frameResults;
   int? _previewWidth;
   int? _previewHeight;
   int? _previewRotationDegrees;
@@ -236,6 +245,7 @@ class CameraController extends ValueNotifier<CameraState> {
       // Tear down any frame processor from a previous session before re-init /
       // device-switch, so frames already queued from the old session don't read
       // buffers the native side is about to recycle (use-after-free).
+      await _stopWorklet();
       _frameProcessorPipeline?.stop();
       _frameProcessorPipeline = null;
 
@@ -399,6 +409,7 @@ class CameraController extends ValueNotifier<CameraState> {
   /// own isolate. For the heaviest work, register a native C/C++ plugin, which
   /// runs synchronously on the camera thread. Pass `null` to disable.
   Future<void> setFrameProcessor(FrameProcessorCallback? callback) async {
+    await _stopWorklet();
     _frameProcessorPipeline?.stop();
     _frameProcessorPipeline = null;
 
@@ -410,6 +421,76 @@ class CameraController extends ValueNotifier<CameraState> {
     await _channel.invokeMethod('setFrameProcessor', {
       'enabled': callback != null,
     });
+  }
+
+  /// A broadcast stream of results sent from a frame worklet via
+  /// `FrameWorklet.send`. Listen here to drive the UI from worklet output.
+  Stream<Object?> get frameResults =>
+      (_frameResults ??= StreamController<Object?>.broadcast()).stream;
+
+  /// Runs a frame worklet on a **background isolate** — the high-performance
+  /// path for heavy per-frame work (ML inference, CV) that would jank the UI if
+  /// run on the main isolate via [setFrameProcessor].
+  ///
+  /// [entry] must be a **top-level or static** function (Dart can't ship a
+  /// closure that captures state to another isolate). It runs once on the worker
+  /// to set up state (e.g. load a model), registers a per-frame handler with
+  /// `worklet.onFrame`, and returns results with `worklet.send` — which surface
+  /// on [frameResults].
+  ///
+  /// Mutually exclusive with [setFrameProcessor] (the native layer has one
+  /// callback slot). Pass `null` to stop the worklet. Frames cross to the worker
+  /// as the same zero-copy FFI pointers — no buffer copy.
+  ///
+  /// [args] is a sendable value handed to the worklet as `FrameWorklet.args` —
+  /// use it for initialization data the worker can't load itself. A background
+  /// isolate **can't read assets** (`rootBundle` needs the main isolate), so
+  /// load your model bytes on the main isolate and pass them here.
+  Future<void> setFrameWorklet(FrameWorkletEntry? entry, {Object? args}) async {
+    await _stopWorklet();
+    _frameProcessorPipeline?.stop();
+    _frameProcessorPipeline = null;
+
+    if (entry != null) {
+      _frameResults ??= StreamController<Object?>.broadcast();
+      final rp = ReceivePort();
+      _workletReceive = rp;
+      rp.listen((msg) {
+        if (msg is SendPort) {
+          _workletControl = msg;
+        } else if (msg == frameWorkletStoppedSignal) {
+          _workletStopped?.complete();
+        } else {
+          final out = _frameResults;
+          if (out != null && !out.isClosed) out.add(msg);
+        }
+      });
+      _workletIsolate = await spawnFrameWorklet(
+        entry,
+        rp.sendPort,
+        RootIsolateToken.instance,
+        args,
+      );
+    }
+
+    await _channel.invokeMethod('setFrameProcessor', {
+      'enabled': entry != null,
+    });
+  }
+
+  /// Stops the frame worklet, waiting for the worker to detach the native
+  /// callback before returning (so a subsequent processor can't race it).
+  Future<void> _stopWorklet() async {
+    if (_workletIsolate == null) return;
+    final done = _workletStopped = Completer<void>();
+    _workletControl?.send('stop');
+    await done.future.timeout(const Duration(seconds: 2), onTimeout: () {});
+    _workletStopped = null;
+    _workletControl = null;
+    _workletReceive?.close();
+    _workletReceive = null;
+    _workletIsolate?.kill(priority: Isolate.beforeNextEvent);
+    _workletIsolate = null;
   }
 
   /// Updates the code scanner configuration.
@@ -455,6 +536,13 @@ class CameraController extends ValueNotifier<CameraState> {
     // Stop any active frame processing immediately
     _frameProcessorPipeline?.stop();
     _frameProcessorPipeline = null;
+    _workletControl?.send('stop');
+    _workletReceive?.close();
+    _workletReceive = null;
+    _workletIsolate?.kill(priority: Isolate.beforeNextEvent);
+    _workletIsolate = null;
+    _frameResults?.close();
+    _frameResults = null;
 
     // Notify native side to shut down camera hardware
     _channel.invokeMethod('dispose');
